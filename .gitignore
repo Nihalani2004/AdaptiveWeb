@@ -1,0 +1,17 @@
+node_modules/
+.pnpm-store/
+.next/
+.env
+.env.local
+.env.*
+!.env.example
+!.env.*.example
+.DS_Store
+dist/
+out/
+build/
+coverage/
+.vscode/
+__pycache__/
+*.pyc
+*.log
