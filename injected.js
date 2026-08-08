@@ -1,0 +1,2401 @@
+(function () {
+    if (window.AdaptiveWeb) return;
+
+    const CONFIG = {
+        // Feature 1: Reading Difficulty
+        difficultyRevisitCount: 3,
+        difficultyTimeWindow: 10000, // 10s
+
+        // Feature 2: Engaged Reader
+        engagedScrollMaxSpeed: 300, // px/s
+        engagedHoverTime: 3000,
+        engagedMinDepth: 0.5, // 50%
+
+        // Feature 3: Skimmer
+        skimScrollMinSpeed: 800,
+        skimEventCount: 3,
+        skimTimeWindow: 5000,
+
+        // Feature 4: Exit Intent
+        exitThresholdY: 50,
+
+        // Advanced Cursor Hesitation
+        cursorSampleWindow: 4000,
+        cursorSampleInterval: 60,
+        cursorAnalysisInterval: 250,
+        cursorSuspectScore: 0.55,
+        cursorConfirmScore: 0.72,
+        cursorConfirmationTime: 600,
+        cursorStationaryTime: 1600,
+        cursorCooldown: 30000,
+        cursorDismissCooldown: 90000,
+        cursorPromptLimit: 3,
+
+        serverUrl: 'http://localhost:8000/api',
+        debug: true
+    };
+
+    class BehaviorDetector {
+        constructor(ui) {
+            this.ui = ui;
+            this.api = new ApiService();
+
+            this.initScrollAnalysis();
+            // this.initParagraphTracking(); // Disable "Simplify" feature as requested
+            this.initExitIntent();
+            this.initHoverDwell(); // New Universal Hover
+        }
+
+        // --- Feature 5: Universal Hover Dwell ---
+        initHoverDwell() {
+            let hoverTimer = null;
+            let currentTarget = null;
+
+            document.body.addEventListener('mouseover', (e) => {
+                const target = e.target.closest('p, article, h1, h2, h3, li');
+                if (!target || this.isAdaptiveWebElement(target) || target === currentTarget) return;
+
+                // Clear previous
+                if (hoverTimer) clearTimeout(hoverTimer);
+                if (currentTarget) this.ui.removeHoverEffect(currentTarget);
+
+                currentTarget = target;
+
+                // Start Timer (1.5s as requested)
+                hoverTimer = setTimeout(() => {
+                    if (currentTarget && currentTarget.isConnected) {
+                        this.onHoverDwell(currentTarget);
+                    }
+                }, 1500);
+            }, { passive: true });
+
+            document.body.addEventListener('mouseout', (e) => {
+                if (!currentTarget) return;
+
+                // Only clear if we really left the element (not just moved to a child)
+                if (currentTarget.contains(e.relatedTarget)) return;
+
+                if (hoverTimer) clearTimeout(hoverTimer);
+                this.ui.removeHoverEffect(currentTarget);
+                currentTarget = null;
+            }, { passive: true });
+
+            // Clear on scroll to prevent sticky highlights
+            window.addEventListener('scroll', () => {
+                if (hoverTimer) clearTimeout(hoverTimer);
+                if (currentTarget) this.ui.removeHoverEffect(currentTarget);
+                currentTarget = null;
+            }, { passive: true });
+        }
+
+        onHoverDwell(element) {
+            if (CONFIG.debug) console.log('Detected: Universal Hover Dwell', element);
+
+            // Smarter Theme Detection: Traverse up to find effective background
+            const bgColor = this.getEffectiveBackgroundColor(element);
+            const isDark = this.isDarkColor(bgColor);
+
+            this.ui.applyHoverEffect(element, isDark, this.api);
+            this.api.log('hover_dwell', {
+                tag: element.tagName,
+                text_len: element.innerText.length,
+                theme: isDark ? 'dark' : 'light',
+                bg_color: bgColor
+            });
+        }
+
+        getEffectiveBackgroundColor(el) {
+            let current = el;
+            while (current) {
+                const style = window.getComputedStyle(current);
+                const color = style.backgroundColor;
+                // Check if transparent (rgba(0,0,0,0) or transparent)
+                if (color && color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent') {
+                    return color;
+                }
+                current = current.parentElement;
+            }
+            return 'rgb(255, 255, 255)'; // Fallback to white (Light Mode) if no bg found
+        }
+
+        isDarkColor(color) {
+            if (!color) return false;
+
+            const rgb = color.match(/\d+/g);
+            if (!rgb) return false;
+
+            // Luminance formula
+            const brightness = (parseInt(rgb[0]) * 299 + parseInt(rgb[1]) * 587 + parseInt(rgb[2]) * 114) / 1000;
+            return brightness < 128; // < 128 is dark
+        }
+
+        // --- Feature 1: Reading Difficulty (Re-reading) ---
+        initParagraphTracking() {
+            const paragraphs = document.querySelectorAll('p');
+            // Store revisit timestamps: Map<Element, number[]>
+            this.paragraphVisits = new Map();
+
+            // IntersectionObserver to detect when a paragraph enters viewport
+            const observer = new IntersectionObserver((entries) => {
+                const now = Date.now();
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        this.registerVisit(entry.target, now);
+                    }
+                });
+            }, { threshold: 0.8 }); // Must be 80% visible
+
+            paragraphs.forEach(p => observer.observe(p));
+        }
+
+        registerVisit(p, time) {
+            if (!this.paragraphVisits.has(p)) {
+                this.paragraphVisits.set(p, []);
+            }
+            const visits = this.paragraphVisits.get(p);
+            // Clean old visits
+            while (visits.length > 0 && time - visits[0] > CONFIG.difficultyTimeWindow) {
+                visits.shift();
+            }
+            visits.push(time);
+
+            // Check Trigger
+            if (visits.length >= CONFIG.difficultyRevisitCount) {
+                if (!p.classList.contains('aw-difficulty-processed')) {
+                    this.onReadingDifficulty(p);
+                }
+            }
+        }
+
+        onReadingDifficulty(p) {
+            if (CONFIG.debug) console.log('Detected: Reading Difficulty', p);
+            p.classList.add('aw-difficulty-processed');
+            this.ui.highlightAndPrompt(p, async () => {
+                const simplified = await this.api.simplify(p.innerText);
+                if (simplified) this.ui.updateParagraph(p, simplified.simplified);
+            });
+            this.api.log('reading_difficulty', { text_len: p.innerText.length });
+        }
+
+        // --- Feature 2 & 3: Scroll Analysis (Engaged & Skimmer) ---
+        initScrollAnalysis() {
+            let lastScrollY = window.scrollY;
+            let lastScrollTime = Date.now();
+            let scrollEvents = []; // {time, speed}
+
+            window.addEventListener('scroll', () => {
+                const now = Date.now();
+                const currentY = window.scrollY;
+                const dt = now - lastScrollTime;
+
+                if (dt > 100) { // Check every 100ms
+                    const dy = Math.abs(currentY - lastScrollY);
+                    const speed = (dy / dt) * 1000; // px/sec
+
+                    this.checkSkimmer(now, speed, scrollEvents);
+                    this.checkEngaged(now, speed, currentY);
+
+                    lastScrollY = currentY;
+                    lastScrollTime = now;
+                }
+            }, { passive: true });
+        }
+
+        checkSkimmer(now, speed, events) {
+            if (speed > CONFIG.skimScrollMinSpeed) {
+                events.push(now);
+                // Clean old
+                while (events.length > 0 && now - events[0] > CONFIG.skimTimeWindow) {
+                    events.shift();
+                }
+
+                if (events.length >= CONFIG.skimEventCount) {
+                    this.onSkimmerDetected();
+                    // Reset to avoid spam
+                    events.length = 0;
+                }
+            }
+        }
+
+        async onSkimmerDetected() {
+            if (this.skimmerTriggered) return;
+            this.skimmerTriggered = true;
+
+            if (CONFIG.debug) console.log('Detected: Skimmer');
+            this.ui.showToast('We see you are skimming! Loading key takeaways...');
+            this.api.log('skimmer_detected');
+
+            const text = document.body.innerText.substring(0, 1000);
+            const summary = await this.api.summarize(text);
+            if (summary) {
+                this.ui.showTakeaways(summary.summary);
+            }
+        }
+
+        checkEngaged(now, speed, scrollY) {
+            if (this.engagedTriggered) return;
+            // Check Depth
+            const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+            const depth = scrollY / docHeight;
+
+            if (depth > CONFIG.engagedMinDepth && speed < CONFIG.engagedScrollMaxSpeed && speed > 0) {
+                // We are deep and scrolling slowly.
+                // Simplified "Hover" check: Assume if scrolling slow deep, they are engaged.
+                // Real hover check is expensive on all elements.
+
+                // Debounce
+                if (!this.engagedTimer) {
+                    this.engagedTimer = setTimeout(() => {
+                        this.onEngagedReader();
+                    }, CONFIG.engagedHoverTime);
+                }
+            } else {
+                if (this.engagedTimer) {
+                    clearTimeout(this.engagedTimer);
+                    this.engagedTimer = null;
+                }
+            }
+        }
+
+        async onEngagedReader() {
+            this.engagedTriggered = true;
+            if (CONFIG.debug) console.log('Detected: Engaged Reader');
+            this.api.log('engaged_reader');
+
+            // Real-time: Scrape the current page for "Related" or interesting links
+            const relatedLinks = this.scrapeRelatedLinks();
+
+            if (relatedLinks.length > 0) {
+                this.ui.showSidebar(relatedLinks);
+            } else {
+                // Fallback to API if we can't find anything nice
+                const related = await this.api.getRelated(window.location.href);
+                if (related) {
+                    this.ui.showSidebar(related.articles);
+                }
+            }
+        }
+
+        scrapeRelatedLinks() {
+            // Heuristic: Find links in <aside>, or links with images, or just reasonable links
+            const links = [];
+            const candidates = document.querySelectorAll('aside a, .sidebar a, .related a, article a');
+
+            for (let a of candidates) {
+                if (links.length >= 5) break;
+
+                // Filter nice links
+                const title = a.innerText.trim();
+                if (title.length > 15 && a.href && !a.href.includes('#')) {
+                    // Try to find an image nearby
+                    let img = a.querySelector('img');
+                    if (!img) {
+                        // Look at parent
+                        const parent = a.parentElement;
+                        if (parent) img = parent.querySelector('img');
+                    }
+
+                    links.push({
+                        title: title,
+                        url: a.href,
+                        image: img ? img.src : 'https://placehold.co/100x100?text=News' // Fallback
+                    });
+                }
+            }
+
+            // Dedup
+            return links.filter((v, i, a) => a.findIndex(v2 => (v2.url === v.url)) === i);
+        }
+
+        // --- Feature 4: Advanced Cursor Hesitation Assistant ---
+        initCursorHesitation() {
+            if (this.cursorHesitationInitialized) return;
+            this.cursorHesitationInitialized = true;
+
+            const now = performance.now();
+            this.cursorTargetIds = new WeakMap();
+            this.cursorTargetsById = new Map();
+            this.cursorTargetIdCounter = 0;
+            this.cursorTracker = {
+                state: 'observing',
+                samples: [],
+                transitions: [],
+                retreats: [],
+                deadClicks: [],
+                formEvents: [],
+                lastSampleAt: 0,
+                lastSignificantMoveAt: now,
+                lastInputAt: 0,
+                lastTarget: null,
+                lastCoords: null,
+                suspectedAt: 0,
+                suspectedPattern: null,
+                cooldownUntil: 0,
+                mutationVersion: 0,
+                baselineSpeed: this.loadCursorBaseline(),
+                baselineSamples: 0
+            };
+
+            this.cursorMutationObserver = new MutationObserver(() => {
+                this.cursorTracker.mutationVersion += 1;
+            });
+            this.cursorMutationObserver.observe(document.body || document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true
+            });
+
+            document.addEventListener('pointermove', (event) => this.trackCursorSample(event), { passive: true });
+            document.addEventListener('pointerout', (event) => this.trackTargetRetreat(event), { passive: true });
+            document.addEventListener('click', (event) => this.trackPossibleDeadClick(event), true);
+            document.addEventListener('focusin', (event) => this.trackFormInteraction(event, 'focus'), true);
+            document.addEventListener('focusout', (event) => this.trackFormInteraction(event, 'blur'), true);
+            document.addEventListener('invalid', (event) => this.trackFormInteraction(event, 'invalid'), true);
+            document.addEventListener('input', () => {
+                this.cursorTracker.lastInputAt = performance.now();
+            }, true);
+            document.addEventListener('keydown', () => {
+                this.cursorTracker.lastInputAt = performance.now();
+            }, true);
+
+            this.cursorAnalysisTimer = setInterval(
+                () => this.analyzeCursorHesitation(),
+                CONFIG.cursorAnalysisInterval
+            );
+
+            window.addEventListener('pagehide', () => {
+                clearInterval(this.cursorAnalysisTimer);
+                if (this.cursorMutationObserver) this.cursorMutationObserver.disconnect();
+            }, { once: true });
+        }
+
+        trackCursorSample(event) {
+            if (event.pointerType && event.pointerType !== 'mouse') return;
+            if (this.isAdaptiveWebElement(event.target)) return;
+
+            const now = performance.now();
+            const tracker = this.cursorTracker;
+            if (now - tracker.lastSampleAt < CONFIG.cursorSampleInterval) return;
+
+            const target = this.getCursorContextTarget(event.target);
+            const targetId = target ? this.getCursorTargetId(target) : null;
+            const previous = tracker.samples[tracker.samples.length - 1];
+            const sample = {
+                x: event.clientX,
+                y: event.clientY,
+                time: now,
+                target,
+                targetId,
+                targetType: this.getCursorTargetType(target)
+            };
+
+            if (previous) {
+                const distance = Math.hypot(sample.x - previous.x, sample.y - previous.y);
+                const elapsed = Math.max((now - previous.time) / 1000, 0.001);
+                const speed = distance / elapsed;
+
+                if (distance > 4) tracker.lastSignificantMoveAt = now;
+                this.updateCursorBaseline(speed);
+
+                if (targetId && previous.targetId && targetId !== previous.targetId) {
+                    tracker.transitions.push({ from: previous.targetId, to: targetId, time: now });
+                }
+            } else {
+                tracker.lastSignificantMoveAt = now;
+            }
+
+            tracker.samples.push(sample);
+            tracker.lastSampleAt = now;
+            tracker.lastTarget = target;
+            tracker.lastCoords = { x: sample.x, y: sample.y };
+            this.pruneCursorHistory(now);
+        }
+
+        trackTargetRetreat(event) {
+            if (this.isAdaptiveWebElement(event.target)) return;
+            const target = this.getMeaningfulInteractiveTarget(event.target);
+            if (!target || target.contains(event.relatedTarget)) return;
+
+            const now = performance.now();
+            this.cursorTracker.retreats.push({
+                targetId: this.getCursorTargetId(target),
+                time: now
+            });
+            this.pruneCursorHistory(now);
+        }
+
+        trackPossibleDeadClick(event) {
+            if (this.isAdaptiveWebElement(event.target)) return;
+            const target = this.getMeaningfulInteractiveTarget(event.target);
+            if (!target) return;
+
+            const style = window.getComputedStyle(target);
+            if (!this.isInteractiveTarget(target) && style.cursor !== 'pointer') return;
+
+            const tracker = this.cursorTracker;
+            const targetId = this.getCursorTargetId(target);
+            const mutationVersion = tracker.mutationVersion;
+            const locationBefore = window.location.href;
+
+            setTimeout(() => {
+                if (window.location.href !== locationBefore) return;
+                if (tracker.mutationVersion !== mutationVersion) return;
+
+                const now = performance.now();
+                tracker.deadClicks.push({ targetId, time: now });
+                this.pruneCursorHistory(now);
+            }, 450);
+        }
+
+        trackFormInteraction(event, type) {
+            const field = event.target && event.target.closest
+                ? event.target.closest('input, select, textarea, [contenteditable="true"]')
+                : null;
+            if (!field || this.isAdaptiveWebElement(field)) return;
+
+            const now = performance.now();
+            this.cursorTracker.formEvents.push({
+                type,
+                targetId: this.getCursorTargetId(field),
+                invalid: type === 'invalid' ||
+                    field.getAttribute('aria-invalid') === 'true' ||
+                    (field.matches(':invalid') && field.value !== ''),
+                time: now
+            });
+            this.pruneCursorHistory(now);
+        }
+
+        analyzeCursorHesitation() {
+            const tracker = this.cursorTracker;
+            const now = performance.now();
+            if (!tracker || tracker.samples.length === 0) return;
+            if (this.shouldSuppressCursorHelp(now)) {
+                this.resetCursorSuspicion();
+                return;
+            }
+
+            this.pruneCursorHistory(now);
+            if (tracker.samples.length === 0) {
+                this.resetCursorSuspicion();
+                return;
+            }
+            const analysis = this.calculateCursorHesitation(now);
+
+            if (!analysis || analysis.confidence < CONFIG.cursorSuspectScore) {
+                this.resetCursorSuspicion();
+                return;
+            }
+
+            if (tracker.state === 'observing' || tracker.suspectedPattern !== analysis.pattern) {
+                tracker.state = 'suspected';
+                tracker.suspectedAt = now;
+                tracker.suspectedPattern = analysis.pattern;
+                return;
+            }
+
+            if (
+                tracker.state === 'suspected' &&
+                analysis.confidence >= CONFIG.cursorConfirmScore &&
+                now - tracker.suspectedAt >= CONFIG.cursorConfirmationTime
+            ) {
+                this.onCursorHesitation(analysis);
+            }
+        }
+
+        calculateCursorHesitation(now) {
+            const tracker = this.cursorTracker;
+            const samples = tracker.samples;
+            if (!samples || samples.length === 0) return null;
+            const first = samples[0];
+            const last = samples[samples.length - 1];
+            const target = last.target || tracker.lastTarget;
+            const targetId = target ? this.getCursorTargetId(target) : null;
+            const targetType = this.getCursorTargetType(target);
+            const interactive = this.isInteractiveTarget(target);
+            const durationMs = Math.max(now - first.time, now - tracker.lastSignificantMoveAt);
+
+            let pathLength = 0;
+            let absoluteTurn = 0;
+            let signedTurn = 0;
+            let directionChanges = 0;
+
+            for (let index = 1; index < samples.length; index += 1) {
+                pathLength += Math.hypot(
+                    samples[index].x - samples[index - 1].x,
+                    samples[index].y - samples[index - 1].y
+                );
+            }
+
+            for (let index = 2; index < samples.length; index += 1) {
+                const firstAngle = Math.atan2(
+                    samples[index - 1].y - samples[index - 2].y,
+                    samples[index - 1].x - samples[index - 2].x
+                );
+                const secondAngle = Math.atan2(
+                    samples[index].y - samples[index - 1].y,
+                    samples[index].x - samples[index - 1].x
+                );
+                let delta = secondAngle - firstAngle;
+                while (delta > Math.PI) delta -= Math.PI * 2;
+                while (delta < -Math.PI) delta += Math.PI * 2;
+                absoluteTurn += Math.abs(delta);
+                signedTurn += delta;
+                if (Math.abs(delta) > 1.05) directionChanges += 1;
+            }
+
+            const netDistance = Math.hypot(last.x - first.x, last.y - first.y);
+            const pathEfficiency = pathLength > 0 ? netDistance / pathLength : 1;
+            const turnConsistency = absoluteTurn > 0 ? Math.abs(signedTurn) / absoluteTurn : 0;
+            const stationaryDuration = now - tracker.lastSignificantMoveAt;
+            const adaptiveStationaryTime = Math.max(
+                1300,
+                Math.min(2300, CONFIG.cursorStationaryTime + 500 - tracker.baselineSpeed * 0.8)
+            );
+
+            const recentTransitions = tracker.transitions.filter(item => now - item.time <= 4500);
+            const targetSwitches = recentTransitions.length;
+            const alternatingChoices = this.hasAlternatingTargets(recentTransitions);
+            const retreatCount = tracker.retreats.filter(item =>
+                now - item.time <= 5000 && (!targetId || item.targetId === targetId)
+            ).length;
+            const deadClickCount = tracker.deadClicks.filter(item =>
+                now - item.time <= 5000 && (!targetId || item.targetId === targetId)
+            ).length;
+            const recentFormEvents = tracker.formEvents.filter(item => now - item.time <= 8000);
+            const invalidFormEvents = recentFormEvents.filter(item => item.invalid).length;
+            const fieldSwitches = recentFormEvents.filter(item => item.type === 'blur').length;
+            const candidates = [];
+
+            if (interactive && stationaryDuration >= adaptiveStationaryTime) {
+                candidates.push({
+                    pattern: 'stationary_near_action',
+                    confidence: Math.min(0.88, 0.72 + (stationaryDuration - adaptiveStationaryTime) / 8000)
+                });
+            }
+
+            if (pathLength >= 150 && pathEfficiency < 0.42 && absoluteTurn >= 5.2 && turnConsistency >= 0.55) {
+                candidates.push({
+                    pattern: 'circular_searching',
+                    confidence: Math.min(0.94, 0.76 + absoluteTurn / 50 + (0.42 - pathEfficiency) * 0.2)
+                });
+            }
+
+            if (pathLength >= 120 && pathEfficiency < 0.6 && directionChanges >= 4 && turnConsistency < 0.6) {
+                candidates.push({
+                    pattern: 'zigzag_uncertainty',
+                    confidence: Math.min(0.9, 0.7 + directionChanges * 0.025 + (0.6 - pathEfficiency) * 0.1)
+                });
+            }
+
+            if (alternatingChoices || (targetSwitches >= 4 && this.countRecentTargetTypes(samples) <= 3)) {
+                candidates.push({
+                    pattern: 'choice_oscillation',
+                    confidence: Math.min(0.96, 0.8 + targetSwitches * 0.025)
+                });
+            }
+
+            if (retreatCount >= 3) {
+                candidates.push({
+                    pattern: 'approach_and_retreat',
+                    confidence: Math.min(0.92, 0.73 + retreatCount * 0.04)
+                });
+            }
+
+            if (deadClickCount >= 2) {
+                candidates.push({
+                    pattern: 'repeated_dead_click',
+                    confidence: Math.min(0.98, 0.88 + deadClickCount * 0.03)
+                });
+            }
+
+            if (invalidFormEvents > 0 || fieldSwitches >= 3) {
+                candidates.push({
+                    pattern: 'form_difficulty',
+                    confidence: Math.min(0.97, 0.84 + invalidFormEvents * 0.06 + fieldSwitches * 0.015)
+                });
+            }
+
+            if (candidates.length === 0) return null;
+            candidates.sort((a, b) => b.confidence - a.confidence);
+            const winner = candidates[0];
+
+            return {
+                pattern: winner.pattern,
+                confidence: Number(winner.confidence.toFixed(2)),
+                durationMs: Math.round(durationMs),
+                target,
+                targetId,
+                targetType,
+                targetLabel: this.getCursorTargetLabel(target),
+                coords: tracker.lastCoords,
+                pathEfficiency: Number(pathEfficiency.toFixed(2)),
+                directionChanges,
+                targetSwitches,
+                retreatCount,
+                deadClickCount,
+                invalidFormEvents
+            };
+        }
+
+        onCursorHesitation(analysis) {
+            const tracker = this.cursorTracker;
+            if (tracker.state === 'assisting') return;
+
+            const promptCount = this.getCursorPromptCount();
+            tracker.state = 'assisting';
+            tracker.cooldownUntil = performance.now() + CONFIG.cursorCooldown;
+            this.setCursorPromptCount(promptCount + 1);
+
+            if (CONFIG.debug) {
+                console.log('Detected: Advanced Cursor Hesitation', {
+                    pattern: analysis.pattern,
+                    confidence: analysis.confidence,
+                    targetType: analysis.targetType
+                });
+            }
+
+            this.api.log('hesitation', this.getCursorAnalyticsMetadata(analysis, {
+                outcome: 'prompted',
+                promptNumber: promptCount + 1
+            }));
+
+            const shown = this.ui.showSuggestion(analysis, {
+                onSuggest: () => {
+                    this.finishCursorAssistance('accepted_ai', analysis, CONFIG.cursorCooldown);
+                    this.onManualHelp(analysis);
+                },
+                onLocal: () => {
+                    this.finishCursorAssistance('accepted_local', analysis, CONFIG.cursorCooldown);
+                    this.onLocalCursorHelp(analysis);
+                },
+                onDismiss: (reason) => {
+                    const cooldown = reason === 'timeout' ? CONFIG.cursorCooldown : CONFIG.cursorDismissCooldown;
+                    this.finishCursorAssistance(reason === 'timeout' ? 'ignored' : 'dismissed', analysis, cooldown);
+                }
+            });
+
+            if (!shown) this.finishCursorAssistance('suppressed', analysis, CONFIG.cursorCooldown);
+        }
+
+        finishCursorAssistance(outcome, analysis, cooldown) {
+            const tracker = this.cursorTracker;
+            tracker.state = 'cooldown';
+            tracker.cooldownUntil = performance.now() + cooldown;
+            tracker.suspectedAt = 0;
+            tracker.suspectedPattern = null;
+
+            this.api.log(`help_${outcome}`, this.getCursorAnalyticsMetadata(analysis, { outcome }));
+
+            setTimeout(() => {
+                if (tracker.state === 'cooldown' && performance.now() >= tracker.cooldownUntil) {
+                    tracker.state = 'observing';
+                }
+            }, cooldown + 50);
+        }
+
+        async onManualHelp(analysis) {
+            if (CONFIG.debug) console.log('User accepted contextual AI help');
+            const text = this.buildCursorHelpContext(analysis);
+
+            this.ui.showSummary('Analyzing the nearby controls with Gemini...', true);
+
+            const res = await this.api.suggest(text);
+
+            if (res && (Array.isArray(res.actions) || Array.isArray(res.suggestions))) {
+                const actions = Array.isArray(res.actions) ? res.actions : res.suggestions;
+                const source = String(res.method || '').startsWith('gemini') ? 'ai' : 'fallback';
+                this.renderCursorAssistance({
+                    summary: res.summary,
+                    actions
+                }, analysis, source);
+                return;
+            }
+
+            this.renderCursorAssistance(
+                this.buildLocalAssistance(analysis, true),
+                analysis,
+                'fallback'
+            );
+        }
+
+        onLocalCursorHelp(analysis) {
+            const target = analysis.target;
+            if (!target || !target.isConnected) {
+                this.ui.showSummary('The original page control is no longer available.');
+                return;
+            }
+
+            this.ui.highlightAssistedTarget(target);
+            this.ui.showSummary('Inspecting this part of the page locally...');
+            this.renderCursorAssistance(this.buildLocalAssistance(analysis), analysis, 'local');
+        }
+
+        renderCursorAssistance(result, analysis, source) {
+            if (!this.ui.currentSummaryBox || !this.ui.currentSummaryBox.isConnected) {
+                this.ui.showSummary(result.summary || 'Here are some options.');
+            }
+
+            const sourceLabels = {
+                ai: 'Gemini suggestions',
+                fallback: 'Local fallback',
+                local: 'On-device guidance'
+            };
+            this.ui.updateSummaryContent(result.summary, result.actions || [], {
+                source,
+                sourceLabel: sourceLabels[source] || 'Adaptive guidance',
+                onAction: (action) => this.handleSuggestedAction(action, analysis, source),
+                onFeedback: (helpful) => this.recordCursorHelpFeedback(helpful, source, analysis)
+            });
+        }
+
+        buildLocalAssistance(analysis, apiUnavailable = false) {
+            if (analysis.targetType === 'form_field' || analysis.pattern === 'form_difficulty') {
+                return this.buildFormAssistance(analysis, apiUnavailable);
+            }
+            if (analysis.pattern === 'choice_oscillation' || analysis.targetType === 'choice') {
+                return this.buildChoiceAssistance(analysis, apiUnavailable);
+            }
+            if (analysis.pattern === 'repeated_dead_click') {
+                return this.buildDeadClickAssistance(analysis, apiUnavailable);
+            }
+            return this.buildGenericLocalAssistance(analysis, apiUnavailable);
+        }
+
+        buildFormAssistance(analysis, apiUnavailable = false) {
+            const target = analysis.target;
+            const form = target && target.closest ? target.closest('form') : null;
+            const issues = this.getFormFieldIssues(form);
+            const prefix = apiUnavailable ? 'AI is unavailable, but the form was checked locally. ' : '';
+            const actions = issues.slice(0, 3).map((issue, index) => ({
+                id: `form-issue-${index + 1}`,
+                label: `Go to ${issue.label}`,
+                description: issue.reason,
+                actionType: 'focus',
+                targetId: issue.targetId,
+                confidence: 1,
+                requiresConfirmation: false
+            }));
+
+            if (actions.length > 0) {
+                return {
+                    summary: `${prefix}${issues.length} field${issues.length === 1 ? ' needs' : 's need'} attention before you continue.`,
+                    actions
+                };
+            }
+
+            const submit = form && form.querySelector
+                ? form.querySelector('button[type="submit"], input[type="submit"], button:not([type])')
+                : null;
+            if (submit && (submit.disabled || submit.getAttribute('aria-disabled') === 'true')) {
+                return {
+                    summary: `${prefix}The required fields look complete, but the submit control is currently disabled.`,
+                    actions: [this.createLocalAction(submit, 'Inspect the disabled submit control', 'Check whether the page requires another choice or confirmation.', 'highlight')]
+                };
+            }
+
+            return {
+                summary: `${prefix}No missing required fields were found. The selected field is ready for input.`,
+                actions: target ? [this.createLocalAction(target, 'Continue with this field', 'Focus the field without entering or submitting any data.', 'focus')] : []
+            };
+        }
+
+        buildChoiceAssistance(analysis, apiUnavailable = false) {
+            const descriptors = this.getNearbyActionDescriptors(analysis.target)
+                .filter(item => ['choice', 'button', 'link'].includes(item.type))
+                .slice(0, 4);
+            const prefix = apiUnavailable ? 'AI is unavailable, so these options were compared locally. ' : '';
+            return {
+                summary: descriptors.length > 1
+                    ? `${prefix}You were moving between ${descriptors.length} nearby choices. Their current states are shown below.`
+                    : `${prefix}Only one nearby choice could be identified.`,
+                actions: descriptors.map((item, index) => ({
+                    id: `choice-${index + 1}`,
+                    label: item.label,
+                    description: item.stateSummary,
+                    actionType: item.type === 'form_field' ? 'focus' : 'highlight',
+                    targetId: item.targetId,
+                    confidence: 1,
+                    requiresConfirmation: false
+                }))
+            };
+        }
+
+        buildDeadClickAssistance(analysis, apiUnavailable = false) {
+            const diagnosis = this.diagnoseDeadClickTarget(analysis.target);
+            const prefix = apiUnavailable ? 'AI is unavailable. ' : '';
+            const actions = [];
+            if (diagnosis.relatedTarget) {
+                actions.push(this.createLocalAction(
+                    diagnosis.relatedTarget,
+                    diagnosis.relatedLabel || 'Go to the required field',
+                    diagnosis.relatedReason || 'Complete this prerequisite before trying the control again.',
+                    'focus'
+                ));
+            }
+            if (analysis.target) {
+                actions.push(this.createLocalAction(
+                    analysis.target,
+                    'Inspect the unresponsive control',
+                    'Highlight the exact control that did not produce a visible page change.',
+                    'highlight'
+                ));
+            }
+            return {
+                summary: `${prefix}${diagnosis.message}`,
+                actions: actions.slice(0, 3)
+            };
+        }
+
+        buildGenericLocalAssistance(analysis, apiUnavailable = false) {
+            const descriptors = this.getNearbyActionDescriptors(analysis.target).slice(0, 3);
+            const prefix = apiUnavailable ? 'AI is unavailable, so nearby controls were inspected locally. ' : '';
+            return {
+                summary: `${prefix}${this.getCursorPatternDescription(analysis.pattern, analysis.targetLabel)}`,
+                actions: descriptors.map((item, index) => ({
+                    id: `nearby-${index + 1}`,
+                    label: `Show ${item.label}`,
+                    description: item.stateSummary,
+                    actionType: item.type === 'form_field' ? 'focus' : 'highlight',
+                    targetId: item.targetId,
+                    confidence: 1,
+                    requiresConfirmation: false
+                }))
+            };
+        }
+
+        createLocalAction(target, label, description, actionType = 'highlight') {
+            return {
+                id: `local-${this.getCursorTargetId(target) || Date.now()}`,
+                label,
+                description,
+                actionType,
+                targetId: this.getCursorTargetId(target),
+                confidence: 1,
+                requiresConfirmation: false
+            };
+        }
+
+        handleSuggestedAction(action, analysis, source) {
+            const normalized = typeof action === 'string'
+                ? { label: action, actionType: 'highlight', targetId: null }
+                : action || {};
+            const target = this.resolveCursorTarget(normalized.targetId) || analysis.target;
+            const actionType = ['highlight', 'focus', 'compare', 'activate'].includes(normalized.actionType)
+                ? normalized.actionType
+                : 'highlight';
+
+            if (!target || !target.isConnected) {
+                this.ui.setAssistanceStatus('That page control is no longer available. The page may have changed.', 'warning');
+                return;
+            }
+
+            if (actionType === 'compare') {
+                this.renderCursorAssistance(this.buildChoiceAssistance({ ...analysis, target }), analysis, 'local');
+                return;
+            }
+
+            this.ui.highlightAssistedTarget(target);
+            if (actionType === 'focus') {
+                if (typeof target.focus === 'function') target.focus({ preventScroll: false });
+                this.ui.setAssistanceStatus('The relevant field is focused. No value was entered.', 'success');
+                this.api.log('cursor_action_guided', this.getCursorAnalyticsMetadata(analysis, {
+                    source,
+                    action_type: 'focus'
+                }));
+                return;
+            }
+
+            if (actionType !== 'activate') {
+                this.ui.setAssistanceStatus('The relevant control is highlighted. You remain in control of the next step.', 'success');
+                this.api.log('cursor_action_guided', this.getCursorAnalyticsMetadata(analysis, {
+                    source,
+                    action_type: 'highlight'
+                }));
+                return;
+            }
+
+            const activation = this.getSafeActivationPolicy(target);
+            if (!activation.allowed) {
+                this.ui.setAssistanceStatus(`${activation.reason} The control was highlighted but not activated.`, 'warning');
+                return;
+            }
+
+            this.ui.showActionConfirmation(normalized, () => {
+                const latestPolicy = this.getSafeActivationPolicy(target);
+                if (!target.isConnected || !latestPolicy.allowed) {
+                    this.ui.setAssistanceStatus('The control changed and can no longer be safely activated.', 'warning');
+                    return;
+                }
+                target.click();
+                this.api.log('cursor_action_executed', this.getCursorAnalyticsMetadata(analysis, {
+                    source,
+                    action_type: 'activate'
+                }));
+            });
+        }
+
+        resolveCursorTarget(targetId) {
+            if (!targetId || !this.cursorTargetsById) return null;
+            const target = this.cursorTargetsById.get(targetId);
+            if (target && target.isConnected) return target;
+            this.cursorTargetsById.delete(targetId);
+            return null;
+        }
+
+        recordCursorHelpFeedback(helpful, source, analysis) {
+            const storageKey = 'aw-cursor-help-feedback-v1';
+            try {
+                const feedback = JSON.parse(localStorage.getItem(storageKey) || '{}');
+                const key = `${source}:${analysis.pattern}`;
+                const entry = feedback[key] || { helpful: 0, notHelpful: 0 };
+                if (helpful) entry.helpful += 1;
+                else entry.notHelpful += 1;
+                feedback[key] = entry;
+                localStorage.setItem(storageKey, JSON.stringify(feedback));
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb feedback could not be saved', error);
+            }
+            this.api.log('cursor_help_feedback', this.getCursorAnalyticsMetadata(analysis, {
+                source,
+                helpful: Boolean(helpful)
+            }));
+        }
+
+        buildCursorHelpContext(analysis) {
+            const target = analysis.target;
+            const container = target && target.closest
+                ? target.closest('form, section, article, main, nav, aside') || target.parentElement
+                : document.querySelector('main, article') || document.body;
+            const nearbyText = this.redactSensitiveText((container && container.innerText) || '').slice(0, 1600);
+            const availableActions = this.getNearbyActionDescriptors(target).slice(0, 8);
+            const missingFields = this.getMissingFormFields(target && target.closest ? target.closest('form') : null);
+
+            return JSON.stringify({
+                schemaVersion: 2,
+                page: {
+                    domain: window.location.hostname,
+                    title: this.redactSensitiveText(document.title).slice(0, 160)
+                },
+                behavior: {
+                    pattern: analysis.pattern,
+                    confidence: analysis.confidence,
+                    focusedControlType: analysis.targetType,
+                    focusedControlLabel: analysis.targetLabel || 'Unlabelled control'
+                },
+                availableActions: availableActions.map(item => ({
+                    targetId: item.targetId,
+                    label: item.label,
+                    type: item.type,
+                    state: item.stateSummary,
+                    capabilities: item.capabilities
+                })),
+                missingRequiredFields: missingFields,
+                nearbyContext: nearbyText
+            });
+        }
+
+        getCursorPatternDescription(pattern, targetLabel = '') {
+            const subject = targetLabel ? ` near “${targetLabel}”` : '';
+            const descriptions = {
+                stationary_near_action: `You paused${subject}. I can explain this control or suggest the next step.`,
+                circular_searching: 'Your cursor movement suggests you may be searching for an action on this part of the page.',
+                zigzag_uncertainty: 'You appear to be exploring several nearby controls. I can help narrow the choices.',
+                choice_oscillation: 'You appear to be comparing multiple choices.',
+                approach_and_retreat: `You returned to this control several times${subject}.`,
+                repeated_dead_click: 'This control was clicked repeatedly without a visible result.',
+                form_difficulty: 'This form appears to need attention before you can continue.'
+            };
+            return descriptions[pattern] || 'Would you like help with this part of the page?';
+        }
+
+        getCursorAnalyticsMetadata(analysis, extra = {}) {
+            return {
+                pattern: analysis.pattern,
+                confidence: analysis.confidence,
+                duration_ms: analysis.durationMs,
+                target_type: analysis.targetType,
+                path_efficiency: analysis.pathEfficiency,
+                direction_changes: analysis.directionChanges,
+                target_switches: analysis.targetSwitches,
+                retreat_count: analysis.retreatCount,
+                dead_click_count: analysis.deadClickCount,
+                invalid_form_events: analysis.invalidFormEvents,
+                ...extra
+            };
+        }
+
+        shouldSuppressCursorHelp(now) {
+            const tracker = this.cursorTracker;
+            if (document.hidden || now < tracker.cooldownUntil) return true;
+            if (tracker.state === 'assisting') return true;
+            if (this.getCursorPromptCount() >= CONFIG.cursorPromptLimit) return true;
+            if (document.querySelector('.aw-suggestion-bubble, .aw-modal-backdrop')) return true;
+            if (document.querySelector('.aw-highlight, .aw-hover-light, .aw-hover-dark')) return true;
+            if (window.getSelection && window.getSelection().toString().trim()) return true;
+            if (now - tracker.lastInputAt < 1800) return true;
+
+            const active = document.activeElement;
+            if (active && active.isContentEditable && now - tracker.lastInputAt < 5000) return true;
+            const activeMedia = Array.from(document.querySelectorAll('video, audio'))
+                .some(media => !media.paused && !media.ended);
+            if (activeMedia) return true;
+            if (tracker.lastTarget && this.isAdaptiveWebElement(tracker.lastTarget)) return true;
+            return false;
+        }
+
+        resetCursorSuspicion() {
+            const tracker = this.cursorTracker;
+            if (!tracker || tracker.state === 'assisting' || tracker.state === 'cooldown') return;
+            tracker.state = 'observing';
+            tracker.suspectedAt = 0;
+            tracker.suspectedPattern = null;
+        }
+
+        pruneCursorHistory(now) {
+            const tracker = this.cursorTracker;
+            const sampleCutoff = now - CONFIG.cursorSampleWindow;
+            tracker.samples = tracker.samples.filter(item => item.time >= sampleCutoff);
+            tracker.transitions = tracker.transitions.filter(item => now - item.time <= 6000);
+            tracker.retreats = tracker.retreats.filter(item => now - item.time <= 6000);
+            tracker.deadClicks = tracker.deadClicks.filter(item => now - item.time <= 6000);
+            tracker.formEvents = tracker.formEvents.filter(item => now - item.time <= 10000);
+        }
+
+        getCursorContextTarget(node) {
+            return this.getMeaningfulInteractiveTarget(node) || (
+                node && node.closest
+                    ? node.closest('p, li, h1, h2, h3, h4, article, section')
+                    : null
+            );
+        }
+
+        getMeaningfulInteractiveTarget(node) {
+            if (!node || !node.closest) return null;
+            return node.closest([
+                'button',
+                'a[href]',
+                'input:not([type="hidden"])',
+                'select',
+                'textarea',
+                '[contenteditable="true"]',
+                '[role="button"]',
+                '[role="link"]',
+                '[role="option"]',
+                '[role="tab"]',
+                '[role="checkbox"]',
+                '[role="radio"]',
+                'summary',
+                '[tabindex]:not([tabindex="-1"])'
+            ].join(','));
+        }
+
+        isInteractiveTarget(target) {
+            return Boolean(target && this.getMeaningfulInteractiveTarget(target) === target);
+        }
+
+        isAdaptiveWebElement(target) {
+            return Boolean(target && target.closest && target.closest([
+                '.aw-suggestion-bubble',
+                '.aw-takeaways',
+                '.aw-sidebar',
+                '.aw-shortcuts-sidebar',
+                '.aw-modal-backdrop',
+                '.aw-summarize-btn',
+                '.aw-simplify-btn'
+            ].join(',')));
+        }
+
+        getCursorTargetId(target) {
+            if (!target) return null;
+            if (!this.cursorTargetIds.has(target)) {
+                this.cursorTargetIdCounter += 1;
+                this.cursorTargetIds.set(target, `target-${this.cursorTargetIdCounter}`);
+            }
+            const targetId = this.cursorTargetIds.get(target);
+            this.cursorTargetsById?.set(targetId, target);
+            return targetId;
+        }
+
+        getCursorTargetType(target) {
+            if (!target) return 'page_region';
+            const tag = target.tagName ? target.tagName.toLowerCase() : '';
+            const role = target.getAttribute ? target.getAttribute('role') : '';
+            const inputType = tag === 'input' ? String(target.type || '').toLowerCase() : '';
+            if (['checkbox', 'radio'].includes(inputType)) return 'choice';
+            if (['input', 'select', 'textarea'].includes(tag) || target.isContentEditable) return 'form_field';
+            if (tag === 'button' || role === 'button') return 'button';
+            if (tag === 'a' || role === 'link') return 'link';
+            if (['option', 'tab', 'checkbox', 'radio'].includes(role)) return 'choice';
+            if (['p', 'li', 'article', 'section'].includes(tag)) return 'content';
+            return 'interactive';
+        }
+
+        getCursorTargetLabel(target) {
+            if (!target) return '';
+            const labelledBy = target.getAttribute && target.getAttribute('aria-labelledby');
+            const labelledText = labelledBy
+                ? labelledBy.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' ')
+                : '';
+            const associatedLabel = target.labels && target.labels.length
+                ? Array.from(target.labels).map(label => label.innerText || label.textContent || '').join(' ')
+                : '';
+            const raw = labelledText ||
+                associatedLabel ||
+                target.getAttribute?.('aria-label') ||
+                target.getAttribute?.('placeholder') ||
+                target.getAttribute?.('name') ||
+                target.innerText ||
+                '';
+            return this.redactSensitiveText(String(raw).replace(/\s+/g, ' ').trim()).slice(0, 90);
+        }
+
+        getNearbyActionLabels(target) {
+            return this.getNearbyActionDescriptors(target).map(item => item.label);
+        }
+
+        getNearbyActionDescriptors(target) {
+            if (!target) return [];
+            const container = target.closest?.('form, section, article, main, nav, aside') ||
+                target.parentElement || document.body;
+            const selector = [
+                'button',
+                'a[href]',
+                'input:not([type="hidden"])',
+                'select',
+                'textarea',
+                '[role="button"]',
+                '[role="link"]',
+                '[role="option"]',
+                '[role="tab"]',
+                '[role="checkbox"]',
+                '[role="radio"]'
+            ].join(',');
+            const candidates = [target, ...Array.from(container.querySelectorAll?.(selector) || [])];
+            const descriptors = [];
+            const seen = new Set();
+
+            for (const candidate of candidates) {
+                if (!candidate || !candidate.isConnected || this.isAdaptiveWebElement(candidate)) continue;
+                const targetId = this.getCursorTargetId(candidate);
+                if (!targetId || seen.has(targetId)) continue;
+                const label = this.getCursorTargetLabel(candidate);
+                if (!label) continue;
+
+                const disabled = Boolean(candidate.disabled) || candidate.getAttribute?.('aria-disabled') === 'true';
+                const selected = Boolean(candidate.checked) ||
+                    ['true', 'page', 'step'].includes(candidate.getAttribute?.('aria-selected')) ||
+                    ['true', 'page', 'step'].includes(candidate.getAttribute?.('aria-current'));
+                const state = [];
+                if (selected) state.push('Currently selected');
+                state.push(disabled ? 'Disabled' : 'Available');
+                const description = this.redactSensitiveText(
+                    candidate.getAttribute?.('aria-description') ||
+                    candidate.getAttribute?.('title') ||
+                    candidate.getAttribute?.('data-price') ||
+                    ''
+                ).slice(0, 100);
+                if (description && description.toLowerCase() !== label.toLowerCase()) state.push(description);
+                const localDetail = this.getComparableControlDetail(candidate, label);
+                if (localDetail && localDetail.toLowerCase() !== description.toLowerCase()) state.push(localDetail);
+
+                descriptors.push({
+                    targetId,
+                    label,
+                    type: this.getCursorTargetType(candidate),
+                    stateSummary: state.join(' · '),
+                    capabilities: this.getActionCapabilities(candidate)
+                });
+                seen.add(targetId);
+                if (descriptors.length >= 8) break;
+            }
+            return descriptors;
+        }
+
+        getComparableControlDetail(target, label) {
+            if (!target || !target.closest) return '';
+            const container = target.closest([
+                'label',
+                'li',
+                'tr',
+                '[role="option"]',
+                '[role="radio"]',
+                '.option',
+                '.card',
+                '.product'
+            ].join(','));
+            if (!container || container === target) return '';
+            const text = this.redactSensitiveText(container.innerText || container.textContent || '')
+                .replace(String(label || ''), '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            return text.length >= 3 ? text.slice(0, 120) : '';
+        }
+
+        getActionCapabilities(target) {
+            const capabilities = ['highlight'];
+            const targetType = this.getCursorTargetType(target);
+            if (['form_field', 'choice', 'button', 'link'].includes(targetType)) capabilities.push('focus');
+            if (targetType === 'choice') capabilities.push('compare');
+            if (this.getSafeActivationPolicy(target).allowed) capabilities.push('activate');
+            return capabilities;
+        }
+
+        getMissingFormFields(form) {
+            return this.getFormFieldIssues(form).map(issue => issue.label).slice(0, 6);
+        }
+
+        getFormFieldIssues(form) {
+            if (!form || !form.querySelectorAll) return [];
+            const fields = Array.from(form.querySelectorAll([
+                'input[required]',
+                'select[required]',
+                'textarea[required]',
+                'input:invalid',
+                'select:invalid',
+                'textarea:invalid',
+                '[aria-invalid="true"]'
+            ].join(',')));
+            const issues = [];
+
+            for (const field of fields) {
+                if (field.disabled || field.type === 'hidden') continue;
+                const type = String(field.type || '').toLowerCase();
+                const emptyChoice = ['checkbox', 'radio'].includes(type) && field.required && !field.checked;
+                const emptyValue = field.required && !String(field.value || '').trim();
+                const invalid = field.getAttribute?.('aria-invalid') === 'true' ||
+                    (field.validity && field.validity.valid === false);
+                if (!emptyChoice && !emptyValue && !invalid) continue;
+
+                let reason = 'This field needs attention.';
+                if (emptyChoice) reason = 'A required choice has not been selected.';
+                else if (emptyValue) reason = 'This required field is empty.';
+                else if (field.validationMessage) reason = this.redactSensitiveText(field.validationMessage).slice(0, 160);
+                else if (invalid) reason = 'The current value does not match the expected format.';
+
+                issues.push({
+                    targetId: this.getCursorTargetId(field),
+                    label: this.getCursorTargetLabel(field) || field.name || 'required field',
+                    reason,
+                    field
+                });
+                if (issues.length >= 6) break;
+            }
+            return issues;
+        }
+
+        diagnoseDeadClickTarget(target) {
+            if (!target) return { message: 'The original control is no longer available.' };
+            const label = this.getCursorTargetLabel(target) || 'This control';
+            const form = target.closest?.('form');
+            const issues = this.getFormFieldIssues(form);
+
+            if (target.disabled || target.getAttribute?.('aria-disabled') === 'true') {
+                return { message: `${label} is disabled. Another prerequisite may need to be completed first.`, relatedTarget: issues[0]?.field, relatedLabel: issues[0] ? `Go to ${issues[0].label}` : '', relatedReason: issues[0]?.reason };
+            }
+            if (target.getAttribute?.('aria-busy') === 'true' || /loading|pending|busy/i.test(String(target.className || ''))) {
+                return { message: `${label} appears to be busy or loading. Wait for it to finish before trying again.` };
+            }
+
+            const style = window.getComputedStyle(target);
+            if (style.pointerEvents === 'none') {
+                return { message: `${label} is not currently accepting pointer input.` };
+            }
+
+            const rect = target.getBoundingClientRect?.();
+            if (rect && rect.width > 0 && rect.height > 0 && document.elementFromPoint) {
+                const topElement = document.elementFromPoint(
+                    Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2)),
+                    Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2))
+                );
+                if (topElement && topElement !== target && !target.contains(topElement) && !topElement.contains(target)) {
+                    return { message: `${label} appears to be covered by another page element.` };
+                }
+            }
+
+            const tag = target.tagName?.toLowerCase();
+            const href = target.getAttribute?.('href');
+            if (tag === 'a' && (!href || href === '#' || /^javascript:/i.test(href))) {
+                return { message: `${label} does not currently point to a usable destination.` };
+            }
+            if (issues.length > 0) {
+                return {
+                    message: `${label} may be waiting for required form information.`,
+                    relatedTarget: issues[0].field,
+                    relatedLabel: `Go to ${issues[0].label}`,
+                    relatedReason: issues[0].reason
+                };
+            }
+            return { message: `${label} did not produce a visible page change. It may require another step or its page script may not have responded.` };
+        }
+
+        getSafeActivationPolicy(target) {
+            if (!target || typeof target.click !== 'function') {
+                return { allowed: false, reason: 'This page element cannot be safely activated.' };
+            }
+            if (target.disabled || target.getAttribute?.('aria-disabled') === 'true') {
+                return { allowed: false, reason: 'This control is disabled.' };
+            }
+
+            const label = this.getCursorTargetLabel(target);
+            if (this.isSensitiveActionLabel(label)) {
+                return { allowed: false, reason: 'Sensitive or irreversible actions are never activated by AdaptiveWeb.' };
+            }
+
+            const tag = target.tagName?.toLowerCase();
+            const role = target.getAttribute?.('role');
+            const form = target.closest?.('form');
+            if (form && form.querySelector?.('input[type="password"], [autocomplete^="cc-"]')) {
+                return { allowed: false, reason: 'Controls in password or payment forms must be operated manually.' };
+            }
+
+            if (tag === 'a') {
+                if (target.hasAttribute?.('download')) {
+                    return { allowed: false, reason: 'Downloads must be started manually.' };
+                }
+                try {
+                    const url = new URL(target.href, window.location.href);
+                    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol');
+                    return { allowed: true, reason: '' };
+                } catch (error) {
+                    return { allowed: false, reason: 'This link does not have a safe web destination.' };
+                }
+            }
+
+            if (tag === 'input') {
+                return ['checkbox', 'radio'].includes(String(target.type || '').toLowerCase())
+                    ? { allowed: true, reason: '' }
+                    : { allowed: false, reason: 'Text entry and form submission remain manual.' };
+            }
+            if (tag === 'button') {
+                const type = String(target.getAttribute?.('type') || target.type || 'submit').toLowerCase();
+                if (form && type !== 'button') {
+                    return { allowed: false, reason: 'Form submission and reset controls remain manual.' };
+                }
+                return { allowed: true, reason: '' };
+            }
+            if (['option', 'tab', 'checkbox', 'radio'].includes(role)) {
+                return { allowed: true, reason: '' };
+            }
+            return { allowed: false, reason: 'Unknown custom controls are highlighted but not automatically activated.' };
+        }
+
+        isSensitiveActionLabel(label) {
+            return /\b(delete|remove|purchase|pay|checkout|buy|submit|send|publish|transfer|confirm order|place order|sign out|log out|unsubscribe|close account|cancel account)\b/i.test(String(label || ''));
+        }
+
+        hasAlternatingTargets(transitions) {
+            if (transitions.length < 3) return false;
+            const recent = transitions.slice(-3);
+            return recent[0].from === recent[1].to &&
+                recent[0].to === recent[1].from &&
+                recent[1].to === recent[2].from &&
+                recent[1].from === recent[2].to;
+        }
+
+        countRecentTargetTypes(samples) {
+            return new Set(samples.slice(-12).map(item => item.targetId).filter(Boolean)).size;
+        }
+
+        redactSensitiveText(text) {
+            return String(text || '')
+                .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email removed]')
+                .replace(/\b(?:\d[ -]*?){13,19}\b/g, '[number removed]')
+                .replace(/\b(?:\+?\d[\d\s().-]{7,}\d)\b/g, '[phone removed]')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        loadCursorBaseline() {
+            try {
+                const stored = JSON.parse(localStorage.getItem('aw-cursor-baseline-v1') || 'null');
+                if (stored && Number.isFinite(stored.averageSpeed)) {
+                    return Math.max(80, Math.min(1200, stored.averageSpeed));
+                }
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb cursor baseline unavailable', error);
+            }
+            return 350;
+        }
+
+        updateCursorBaseline(speed) {
+            if (!Number.isFinite(speed) || speed < 15 || speed > 2500) return;
+            const tracker = this.cursorTracker;
+            tracker.baselineSpeed = tracker.baselineSpeed * 0.94 + speed * 0.06;
+            tracker.baselineSamples += 1;
+
+            if (tracker.baselineSamples % 40 === 0) {
+                try {
+                    localStorage.setItem('aw-cursor-baseline-v1', JSON.stringify({
+                        averageSpeed: Math.round(tracker.baselineSpeed),
+                        updatedAt: Date.now()
+                    }));
+                } catch (error) {
+                    if (CONFIG.debug) console.debug('AdaptiveWeb cursor baseline could not be saved', error);
+                }
+            }
+        }
+
+        getCursorPromptCount() {
+            try {
+                return Number(sessionStorage.getItem('aw-cursor-prompt-count') || 0);
+            } catch (error) {
+                return 0;
+            }
+        }
+
+        setCursorPromptCount(count) {
+            try {
+                sessionStorage.setItem('aw-cursor-prompt-count', String(count));
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb prompt count could not be saved', error);
+            }
+        }
+
+        // --- Feature 5: Exit Intent ---
+        initExitIntent() {
+            document.addEventListener('mouseleave', (e) => {
+                if (e.clientY < CONFIG.exitThresholdY) {
+                    this.onExitIntent();
+                }
+            });
+        }
+
+        onExitIntent() {
+            if (this.exitTriggered) return;
+            if (document.querySelector('.aw-suggestion-bubble')) return;
+            // Check session storage to prevent annoyance
+            if (sessionStorage.getItem('aw-exit-dismissed')) return;
+
+            this.exitTriggered = true;
+
+            if (CONFIG.debug) console.log('Detected: Exit Intent');
+            this.api.log('exit_intent');
+
+            // Calc Progress
+            const scrollY = window.scrollY;
+            const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+            const progress = (scrollY / docHeight) * 100;
+
+            this.ui.showExitModal(progress, this.api);
+        }
+    }
+
+    class ApiService {
+        async post(endpoint, body, timeoutMs = 5000) {
+            return new Promise((resolve) => {
+                const requestId = 'req_' + Math.random().toString(36).substring(2, 9);
+                let settled = false;
+                const handler = (event) => {
+                    if (event.data && event.data.type === 'AW_API_RESPONSE' && event.data.requestId === requestId) {
+                        if (settled) return;
+                        settled = true;
+                        window.removeEventListener('message', handler);
+                        resolve(event.data.error ? null : event.data.data);
+                    }
+                };
+                window.addEventListener('message', handler);
+                window.postMessage({ type: 'AW_API_REQUEST', requestId, endpoint, body }, '*');
+
+                // Resolve cleanly without leaving page-level listeners behind.
+                setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    window.removeEventListener('message', handler);
+                    resolve(null);
+                }, timeoutMs);
+            });
+        }
+
+        async simplify(text) {
+            return this.post('simplify', { text });
+        }
+
+        async summarize(text) {
+            return this.post('summarize', { text });
+        }
+
+        async suggest(text) {
+            return this.post('suggest', { text }, 15000);
+        }
+
+        async getRelated(url) {
+            return this.post('related', { url });
+        }
+
+        log(type, metadata = {}) {
+            this.post('analytics', {
+                eventType: type,
+                domain: window.location.hostname,
+                timestamp: new Date().toISOString(),
+                metadata
+            });
+        }
+    }
+
+    class UIAdapter {
+        constructor() {
+            this.injectStyles();
+        }
+
+        injectStyles() {
+            const style = document.createElement('style');
+            style.textContent = `
+                /* Highlight */
+                .aw-highlight {
+                    background: rgba(255, 235, 59, 0.2);
+                    box-shadow: 0 0 0 2px rgba(255, 235, 59, 0.4);
+                    border-radius: 4px;
+                    transition: all 0.3s;
+                    position: relative;
+                }
+                .aw-simplify-btn {
+                    position: absolute;
+                    top: -25px;
+                    right: 0;
+                    background: #222;
+                    color: #fff;
+                    font-size: 12px;
+                    padding: 4px 8px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    z-index: 1000;
+                    font-family: sans-serif;
+                }
+                
+                /* Sidebar */
+                .aw-sidebar {
+                    position: fixed;
+                    top: 0;
+                    right: -320px;
+                    width: 320px;
+                    height: 100vh;
+                    background: white;
+                    box-shadow: -2px 0 10px rgba(0,0,0,0.1);
+                    transition: right 0.3s ease-out;
+                    z-index: 9999;
+                    padding: 20px;
+                    font-family: sans-serif;
+                    overflow-y: auto;
+                }
+                .aw-sidebar.visible { right: 0; }
+                .aw-card {
+                    border: 1px solid #eee;
+                    border-radius: 8px;
+                    margin-bottom: 15px;
+                    overflow: hidden;
+                }
+                .aw-card img { width: 100%; height: 100px; object-fit: cover; }
+                .aw-card-content { padding: 10px; }
+                
+                /* Takeaways */
+                .aw-takeaways {
+                    position: fixed;
+                    top: 80px;
+                    right: 20px;
+                    width: min(390px, calc(100vw - 40px));
+                    max-height: calc(100vh - 120px);
+                    background: white;
+                    border-radius: 14px;
+                    box-shadow: 0 4px 15px rgba(0,0,0,0.15);
+                    padding: 15px;
+                    z-index: 2147483645;
+                    font-family: sans-serif;
+                    border-left: 4px solid #3b82f6;
+                    animation: slideIn 0.5s ease;
+                    overflow-y: auto;
+                }
+                @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+                
+                /* Exit Modal */
+                .aw-modal-backdrop {
+                    position: fixed;
+                    top: 0; left: 0; width: 100%; height: 100%;
+                    background: rgba(0,0,0,0.5);
+                    z-index: 10000;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                }
+                .aw-modal {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 12px;
+                    width: 400px;
+                    text-align: center;
+                    font-family: sans-serif;
+                    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+                }
+                .aw-btn {
+                    background: #3b82f6;
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 6px;
+                    margin-top: 15px;
+                    cursor: pointer;
+                    font-size: 16px;
+                    font-weight: bold;
+                }
+                .aw-btn:hover { opacity: 0.9; }
+                .aw-btn.secondary { background: #eee; color: #333; margin-left: 10px; }
+                
+                /* Universal Hover Styles */
+                /* For LIGHT BG websites (Dark Overlay) */
+                .aw-hover-light {
+                    background-color: rgba(0, 0, 0, 0.9) !important;
+                    color: white !important;
+                    border: 2px solid white !important;
+                    box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+                    border-radius: 8px;
+                    transition: all 0.2s ease-out;
+                    z-index: 1000;
+                    position: relative;
+                }
+                
+                /* For DARK BG websites (White Overlay) */
+                .aw-hover-dark {
+                    background-color: rgba(255, 255, 255, 0.9) !important;
+                    color: black !important;
+                    border: 2px solid black !important;
+                    box-shadow: 0 10px 30px rgba(255,255,255,0.3);
+                    border-radius: 8px;
+                    transition: all 0.2s ease-out;
+                    z-index: 1000;
+                    position: relative;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        applyHoverEffect(el, isCurrentBgDark, api) {
+            // If current BG is Dark -> We want White Overlay (aw-hover-dark)
+            // If current BG is Light -> We want Black Overlay (aw-hover-light)
+            if (isCurrentBgDark) {
+                el.classList.add('aw-hover-dark');
+            } else {
+                el.classList.add('aw-hover-light');
+            }
+
+            // Inject Summarize Button
+            if (el.querySelector('.aw-summarize-btn')) return;
+
+            const btn = document.createElement('div');
+            btn.className = 'aw-summarize-btn';
+            btn.innerHTML = '📝 Summarize';
+
+            Object.assign(btn.style, {
+                position: 'absolute',
+                top: '-25px',
+                right: '10px',
+                background: isCurrentBgDark ? '#fff' : '#222',
+                color: isCurrentBgDark ? '#000' : '#fff',
+                fontSize: '12px',
+                padding: '4px 8px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                zIndex: '1001',
+                boxShadow: '0 2px 5px rgba(0,0,0,0.2)',
+                fontWeight: 'bold',
+                fontFamily: 'sans-serif'
+            });
+
+            btn.onclick = async (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                btn.innerHTML = 'Thinking...';
+
+                // Use passed API or fallback
+                const apiService = api || new ApiService();
+                const text = el.innerText;
+                const res = await apiService.summarize(text);
+
+                if (res && res.summary) {
+                    this.showTakeaways(res.summary);
+                    btn.innerHTML = 'Done!';
+                    setTimeout(() => btn.innerHTML = '📝 Summarize', 2000);
+                } else {
+                    btn.innerHTML = 'Error';
+                }
+            };
+
+            // Relative position for absolute button
+            const pos = window.getComputedStyle(el).position;
+            if (pos === 'static') {
+                el.style.position = 'relative';
+            }
+
+            el.appendChild(btn);
+        }
+
+        removeHoverEffect(el) {
+            if (el) {
+                el.classList.remove('aw-hover-light', 'aw-hover-dark');
+                const btn = el.querySelector('.aw-summarize-btn');
+                if (btn) btn.remove();
+            }
+        }
+
+        // 1. Difficulty
+        highlightAndPrompt(p, onSimplify) {
+            p.classList.add('aw-highlight');
+            const btn = document.createElement('div');
+            btn.className = 'aw-simplify-btn';
+            btn.innerHTML = '✨ Simplify';
+            btn.onclick = (e) => {
+                e.stopPropagation();
+                btn.innerHTML = 'Thinking...';
+                onSimplify();
+            };
+            // Insert relative to P
+            p.style.position = 'relative';
+            p.appendChild(btn);
+        }
+
+        updateParagraph(p, text) {
+            p.innerHTML = text; // Replace content
+            p.classList.remove('aw-highlight');
+            const btn = p.querySelector('.aw-simplify-btn');
+            if (btn) btn.remove();
+
+            p.style.borderLeft = "4px solid #4caf50";
+            p.style.paddingLeft = "10px";
+        }
+
+        // 2. Sidebar
+        showSidebar(articles) {
+            const sidebar = document.createElement('div');
+            sidebar.className = 'aw-sidebar';
+            sidebar.innerHTML = `
+                <h2>You might also like</h2>
+                <hr style="margin: 10px 0; border: 0; border-top: 1px solid #eee;">
+                ${articles.map(a => `
+                    <div class="aw-card">
+                        <img src="${a.image}" alt="">
+                        <div class="aw-card-content">
+                            <strong>${a.title}</strong>
+                        </div>
+                    </div>
+                `).join('')}
+                <button class="aw-btn" style="width:100%" id="aw-sidebar-close">Close</button>
+            `;
+            document.body.appendChild(sidebar);
+
+            sidebar.querySelector('#aw-sidebar-close').onclick = () => {
+                sidebar.classList.remove('visible');
+                setTimeout(() => sidebar.remove(), 300);
+            }
+
+            // Trigger reflow
+            sidebar.offsetHeight;
+            sidebar.classList.add('visible');
+        }
+
+        // 3. Takeaways
+        showToast(msg) {
+            // Optional simple toast
+            console.log(msg);
+        }
+
+        showLegacySuggestion(coords, onAction) {
+            if (document.querySelector('.aw-suggestion-bubble')) return;
+
+            const bubble = document.createElement('div');
+            bubble.className = 'aw-suggestion-bubble';
+            bubble.innerHTML = `
+                <div class="aw-suggestion-arrow"></div>
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <span style="font-size:14px;">💡 Need a hint?</span>
+                    <button class="aw-help-btn">Suggest Actions</button>
+                    <div class="aw-suggestion-close">&times;</div>
+                </div>
+            `;
+
+            // Inline Styles for Bubble (Injecting class in stylesheet is cleaner but this works for now)
+            Object.assign(bubble.style, {
+                position: 'absolute',
+                left: (coords.x + window.scrollX + 20) + 'px',
+                top: (coords.y + window.scrollY) + 'px',
+                background: '#fff',
+                color: '#333',
+                padding: '8px 12px',
+                borderRadius: '50px', // Pill shape
+                boxShadow: '0 4px 15px rgba(0,0,0,0.15)',
+                zIndex: '9999',
+                fontFamily: 'sans-serif',
+                border: '1px solid #eee',
+                animation: 'fadeIn 0.3s ease',
+                display: 'flex',
+                alignItems: 'center'
+            });
+
+            // Button Style
+            const btn = bubble.querySelector('.aw-help-btn');
+            Object.assign(btn.style, {
+                background: '#3b82f6',
+                color: 'white',
+                border: 'none',
+                borderRadius: '20px',
+                padding: '5px 12px',
+                fontSize: '12px',
+                fontWeight: 'bold',
+                cursor: 'pointer',
+                marginLeft: '5px'
+            });
+
+            // Close Style
+            const close = bubble.querySelector('.aw-suggestion-close');
+            Object.assign(close.style, {
+                marginLeft: '8px',
+                cursor: 'pointer',
+                fontSize: '16px',
+                color: '#888'
+            });
+
+            document.body.appendChild(bubble);
+
+            // Events
+            btn.onclick = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onAction();
+                bubble.remove();
+            };
+
+            close.onclick = (e) => {
+                e.stopPropagation();
+                bubble.remove();
+            };
+
+            // Auto-dismiss after 8 seconds
+            setTimeout(() => {
+                if (bubble.isConnected) bubble.remove();
+            }, 8000);
+        }
+
+        showSuggestion(analysis, callbacks) {
+            if (document.querySelector('.aw-suggestion-bubble')) return false;
+
+            const bubble = document.createElement('div');
+            bubble.className = 'aw-suggestion-bubble aw-suggestion-bubble--advanced';
+            bubble.setAttribute('role', 'dialog');
+            bubble.setAttribute('aria-live', 'polite');
+            bubble.setAttribute('aria-label', 'AdaptiveWeb contextual assistance');
+
+            bubble.innerHTML = `
+                <div class="aw-suggestion-arrow" aria-hidden="true"></div>
+                <div class="aw-suggestion-header">
+                    <span class="aw-suggestion-icon" aria-hidden="true">?</span>
+                    <div class="aw-suggestion-heading-group">
+                        <strong class="aw-suggestion-heading">Need help here?</strong>
+                        <span class="aw-suggestion-pattern"></span>
+                    </div>
+                    <button class="aw-suggestion-close" type="button" aria-label="Dismiss assistance">&times;</button>
+                </div>
+                <p class="aw-suggestion-message"></p>
+                <div class="aw-suggestion-actions">
+                    <button class="aw-help-btn aw-help-primary" type="button">AI Suggestions</button>
+                    <button class="aw-local-help-btn" type="button"></button>
+                </div>
+                <small class="aw-suggestion-privacy">Mouse patterns stay on this device. AI sends redacted nearby page context only after you choose it.</small>
+            `;
+
+            const patternNames = {
+                stationary_near_action: 'Paused near an action',
+                circular_searching: 'Searching pattern',
+                zigzag_uncertainty: 'Exploring nearby options',
+                choice_oscillation: 'Comparing choices',
+                approach_and_retreat: 'Repeatedly revisited',
+                repeated_dead_click: 'Control not responding',
+                form_difficulty: 'Form needs attention'
+            };
+            const localLabels = {
+                form_field: 'Check Form',
+                choice: 'Compare Locally',
+                button: 'Inspect Control',
+                link: 'Inspect Link'
+            };
+
+            bubble.querySelector('.aw-suggestion-pattern').textContent = patternNames[analysis.pattern] || 'Contextual assistance';
+            bubble.querySelector('.aw-suggestion-message').textContent = analysis.targetLabel
+                ? `It looks like you may need help with “${analysis.targetLabel}”.`
+                : 'It looks like you may need help with this part of the page.';
+            bubble.querySelector('.aw-local-help-btn').textContent =
+                analysis.pattern === 'choice_oscillation'
+                    ? 'Compare Locally'
+                    : localLabels[analysis.targetType] || 'Explain Locally';
+
+            document.body.appendChild(bubble);
+
+            const coords = analysis.coords || { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+            const rect = bubble.getBoundingClientRect();
+            const margin = 12;
+            const preferredLeft = coords.x + 18;
+            const preferredTop = coords.y + 18;
+            const left = Math.max(margin, Math.min(preferredLeft, window.innerWidth - rect.width - margin));
+            const top = preferredTop + rect.height < window.innerHeight - margin
+                ? preferredTop
+                : Math.max(margin, coords.y - rect.height - 18);
+            bubble.style.left = `${left}px`;
+            bubble.style.top = `${top}px`;
+
+            requestAnimationFrame(() => bubble.classList.add('aw-visible'));
+
+            let settled = false;
+            let timeoutId;
+            const escapeHandler = (event) => {
+                if (event.key === 'Escape') dismiss('escape');
+            };
+            const dismiss = (reason, action) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                document.removeEventListener('keydown', escapeHandler, true);
+                bubble.classList.remove('aw-visible');
+                setTimeout(() => bubble.remove(), 180);
+                if (action) action();
+                else if (callbacks.onDismiss) callbacks.onDismiss(reason);
+            };
+
+            bubble.querySelector('.aw-help-btn').addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                dismiss('accepted_ai', callbacks.onSuggest);
+            });
+            bubble.querySelector('.aw-local-help-btn').addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                dismiss('accepted_local', callbacks.onLocal);
+            });
+            bubble.querySelector('.aw-suggestion-close').addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                dismiss('close');
+            });
+            document.addEventListener('keydown', escapeHandler, true);
+
+            timeoutId = setTimeout(() => dismiss('timeout'), 10000);
+            return true;
+        }
+
+        highlightAssistedTarget(target) {
+            if (!target || !target.classList) return;
+            target.classList.add('aw-assisted-target');
+            target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+            setTimeout(() => target.classList.remove('aw-assisted-target'), 3500);
+        }
+
+        updateSummaryContent(newText, suggestions = [], options = {}) {
+            if (this.currentSummaryBox) {
+                const contentDiv = this.currentSummaryBox.querySelector('.aw-summary-content');
+                if (!contentDiv) return;
+
+                contentDiv.replaceChildren();
+                if (options.sourceLabel) {
+                    const source = document.createElement('span');
+                    source.className = `aw-assistance-source aw-assistance-source--${options.source || 'local'}`;
+                    source.textContent = String(options.sourceLabel);
+                    contentDiv.appendChild(source);
+                }
+
+                const summary = document.createElement('p');
+                summary.className = 'aw-context-summary-text';
+                summary.textContent = String(newText || 'Here are some options.');
+                contentDiv.appendChild(summary);
+
+                if (Array.isArray(suggestions) && suggestions.length > 0) {
+                    const list = document.createElement('div');
+                    list.className = 'aw-context-suggestions';
+                    suggestions.slice(0, 4).forEach((suggestion, index) => {
+                        const action = typeof suggestion === 'string'
+                            ? { id: `legacy-${index + 1}`, label: suggestion, description: '', actionType: 'highlight' }
+                            : suggestion || {};
+                        const card = document.createElement(options.onAction ? 'button' : 'div');
+                        if (options.onAction) card.type = 'button';
+                        card.className = 'aw-suggestion-card';
+
+                        const label = document.createElement('strong');
+                        label.className = 'aw-suggestion-card-label';
+                        label.textContent = String(action.label || 'Review this control');
+                        card.appendChild(label);
+
+                        if (action.description) {
+                            const description = document.createElement('span');
+                            description.className = 'aw-suggestion-card-description';
+                            description.textContent = String(action.description);
+                            card.appendChild(description);
+                        }
+
+                        if (options.onAction) {
+                            const affordance = document.createElement('span');
+                            affordance.className = 'aw-suggestion-card-affordance';
+                            affordance.textContent = action.actionType === 'activate' ? 'Review action →' : 'Show me →';
+                            card.appendChild(affordance);
+                            card.addEventListener('click', () => options.onAction(action));
+                        }
+                        list.appendChild(card);
+                    });
+                    contentDiv.appendChild(list);
+                }
+
+                const status = document.createElement('div');
+                status.className = 'aw-assistance-status';
+                status.setAttribute('aria-live', 'polite');
+                contentDiv.appendChild(status);
+
+                if (typeof options.onFeedback === 'function') {
+                    const feedback = document.createElement('div');
+                    feedback.className = 'aw-assistance-feedback';
+                    const question = document.createElement('span');
+                    question.textContent = 'Was this helpful?';
+                    const helpful = document.createElement('button');
+                    helpful.type = 'button';
+                    helpful.textContent = 'Yes';
+                    const notHelpful = document.createElement('button');
+                    notHelpful.type = 'button';
+                    notHelpful.textContent = 'Not really';
+                    const submitFeedback = (value) => {
+                        options.onFeedback(value);
+                        helpful.disabled = true;
+                        notHelpful.disabled = true;
+                        question.textContent = 'Thanks — your feedback was saved locally.';
+                    };
+                    helpful.addEventListener('click', () => submitFeedback(true));
+                    notHelpful.addEventListener('click', () => submitFeedback(false));
+                    feedback.append(question, helpful, notHelpful);
+                    contentDiv.appendChild(feedback);
+                }
+            }
+        }
+
+        setAssistanceStatus(message, tone = 'info') {
+            if (!this.currentSummaryBox) return;
+            let status = this.currentSummaryBox.querySelector('.aw-assistance-status');
+            if (!status) {
+                status = document.createElement('div');
+                status.className = 'aw-assistance-status';
+                this.currentSummaryBox.querySelector('.aw-summary-content')?.appendChild(status);
+            }
+            status.className = `aw-assistance-status aw-assistance-status--${tone}`;
+            status.textContent = String(message || '');
+        }
+
+        showActionConfirmation(action, onConfirm) {
+            if (!this.currentSummaryBox) return;
+            const content = this.currentSummaryBox.querySelector('.aw-summary-content');
+            if (!content) return;
+            content.querySelector('.aw-action-confirmation')?.remove();
+
+            const panel = document.createElement('div');
+            panel.className = 'aw-action-confirmation';
+            const title = document.createElement('strong');
+            title.textContent = 'Confirm this page action';
+            const message = document.createElement('p');
+            message.textContent = `AdaptiveWeb can activate “${String(action.label || 'this control')}”. Nothing will happen unless you confirm.`;
+            const buttons = document.createElement('div');
+            buttons.className = 'aw-action-confirmation-buttons';
+            const confirm = document.createElement('button');
+            confirm.type = 'button';
+            confirm.className = 'aw-action-confirm';
+            confirm.textContent = 'Confirm action';
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.className = 'aw-action-cancel';
+            cancel.textContent = 'Cancel';
+            confirm.addEventListener('click', () => {
+                panel.remove();
+                this.setAssistanceStatus('Action confirmed. Activating the selected control.', 'success');
+                onConfirm();
+            });
+            cancel.addEventListener('click', () => {
+                panel.remove();
+                this.setAssistanceStatus('Action cancelled. No page control was activated.', 'info');
+            });
+            buttons.append(confirm, cancel);
+            panel.append(title, message, buttons);
+            content.appendChild(panel);
+            confirm.focus();
+        }
+        showLegacySummary(initialText, isLoading = false) {
+            // Remove existing if any
+            if (this.currentSummaryBox && this.currentSummaryBox.isConnected) {
+                this.currentSummaryBox.remove();
+            }
+
+            const box = document.createElement('div');
+            box.className = 'aw-takeaways'; // Reuse existing styles
+            this.currentSummaryBox = box;
+
+            box.innerHTML = `
+                <h3 style="margin:0 0 10px 0">⚡ Adaptive Helper</h3>
+                <div class="aw-summary-content">
+                    <p style="font-size: 14px; line-height: 1.5; color: #444;">
+                        ${isLoading ? '<i>' + initialText + '</i>' : initialText}
+                    </p>
+                </div>
+                <div style="text-align:right; margin-top:10px;">
+                    <small style="color:#888; cursor:pointer;" id="aw-takeaways-close">Dismiss</small>
+                </div>
+            `;
+            document.body.appendChild(box);
+
+            box.querySelector('#aw-takeaways-close').onclick = () => {
+                box.remove();
+                this.currentSummaryBox = null;
+            };
+        }
+
+        showSummary(initialText, isLoading = false) {
+            if (this.currentSummaryBox && this.currentSummaryBox.isConnected) {
+                this.currentSummaryBox.remove();
+            }
+
+            const box = document.createElement('div');
+            box.className = 'aw-takeaways';
+            box.setAttribute('role', 'dialog');
+            box.setAttribute('aria-label', 'AdaptiveWeb assistance');
+            box.setAttribute('aria-live', 'polite');
+            this.currentSummaryBox = box;
+
+            const heading = document.createElement('h3');
+            heading.textContent = 'Adaptive Helper';
+            heading.style.margin = '0 0 10px 0';
+
+            const content = document.createElement('div');
+            content.className = 'aw-summary-content';
+            const paragraph = document.createElement('p');
+            paragraph.className = 'aw-context-summary-text';
+            paragraph.textContent = String(initialText || '');
+            if (isLoading) paragraph.setAttribute('aria-busy', 'true');
+            content.appendChild(paragraph);
+
+            const footer = document.createElement('div');
+            footer.style.textAlign = 'right';
+            footer.style.marginTop = '10px';
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'aw-summary-dismiss';
+            close.textContent = 'Dismiss';
+            close.addEventListener('click', () => {
+                box.remove();
+                this.currentSummaryBox = null;
+            });
+            footer.appendChild(close);
+
+            box.append(heading, content, footer);
+            document.body.appendChild(box);
+        }
+
+        showTakeaways(summary) {
+            // "Summarize" button output -> Use same box but add expansion logic
+            if (this.currentSummaryBox && this.currentSummaryBox.isConnected) {
+                this.currentSummaryBox.remove();
+            }
+
+            const box = document.createElement('div');
+            box.className = 'aw-takeaways';
+            this.currentSummaryBox = box;
+
+            // Simple truncate for visual cleaness, "Expand" to see full
+            const isLong = summary.length > 150; // Lowered from 300
+            const displaySummary = isLong ? summary.substring(0, 150) + '...' : summary;
+
+            box.innerHTML = `
+                <h3 style="margin:0 0 10px 0">⚡ Key Takeaways</h3>
+                <div class="aw-summary-content">
+                    <p style="font-size: 14px; line-height: 1.5; color: #444;">${displaySummary}</p>
+                </div>
+                ${isLong ? '<div style="margin-top:5px;"><button id="aw-expand-btn" style="background:none; border:none; color:#3b82f6; cursor:pointer; font-size:12px; font-weight:bold; padding:0;">View Full Context ⬇</button></div>' : ''}
+                <div style="text-align:right; margin-top:10px;">
+                    <small style="color:#888; cursor:pointer;" id="aw-takeaways-close">Dismiss</small>
+                </div>
+            `;
+            document.body.appendChild(box);
+
+            // Expand Logic
+            if (isLong) {
+                box.querySelector('#aw-expand-btn').onclick = (e) => {
+                    e.target.remove();
+                    box.querySelector('.aw-summary-content p').innerText = summary;
+                };
+            }
+
+            box.querySelector('#aw-takeaways-close').onclick = () => box.remove();
+        }
+
+        showExitModal(progress, api) {
+            if (document.querySelector('.aw-modal-backdrop')) return;
+
+            let title = "Wait!";
+            let text = "Don't miss out.";
+            let btnText = "Stay";
+
+            if (progress < 30) {
+                title = "Save for later?";
+                text = "You've barely started. Enter your email to get the PDF.";
+                btnText = "Save Article";
+            } else if (progress > 70) {
+                title = "Loved it?";
+                text = "Share this with your network before you go.";
+                btnText = "Share Article";
+            } else {
+                title = "Jump to conclusion?";
+                text = "Short on time? Read the summary instead.";
+                btnText = "Show Summary";
+            }
+
+            const backdrop = document.createElement('div');
+            backdrop.className = 'aw-modal-backdrop';
+            backdrop.innerHTML = `
+                <div class="aw-modal">
+                    <h2>${title}</h2>
+                    <p style="color:#666; margin: 15px 0;">${text}</p>
+                    <button class="aw-btn" id="aw-modal-pri">${btnText}</button>
+                    <button class="aw-btn secondary" id="aw-modal-sec">Close</button>
+                </div>
+            `;
+            document.body.appendChild(backdrop);
+
+            // Handlers
+            const close = () => {
+                backdrop.remove();
+                sessionStorage.setItem('aw-exit-dismissed', 'true'); // Prevent reappear
+            };
+
+            backdrop.querySelector('#aw-modal-sec').onclick = close;
+
+            const primaryBtn = backdrop.querySelector('#aw-modal-pri');
+            primaryBtn.onclick = async () => {
+                if (btnText === "Show Summary") {
+                    primaryBtn.innerText = "Summarizing...";
+                    const text = document.body.innerText.substring(0, 2000);
+                    const summary = await api.summarize(text);
+                    if (summary) {
+                        this.showTakeaways(summary.summary);
+                        close();
+                    }
+                } else {
+                    alert("Feature coming soon!");
+                    close();
+                }
+            };
+        }
+    }
+
+    class ShortcutsManager {
+        constructor(api) {
+            this.api = api;
+            this.shortcuts = [];
+            this.init();
+        }
+
+        async init() {
+            // Get content for context
+            const text = document.body.innerText.substring(0, 3000);
+            const res = await this.api.post('shortcuts', { text });
+
+            if (res && res.shortcuts && res.shortcuts.length > 0) {
+                this.shortcuts = res.shortcuts;
+                this.renderSidebar();
+                this.startListening();
+            }
+        }
+
+        renderSidebar() {
+            const container = document.createElement('div');
+            container.className = 'aw-shortcuts-sidebar';
+            container.innerHTML = `
+                <div style="margin-bottom:10px; font-weight:bold; color:#888; font-size:11px; text-transform:uppercase; letter-spacing:1px;">Shortcuts</div>
+                ${this.shortcuts.map(s => `
+                    <div class="aw-shortcut-item" data-key="${s.key.toLowerCase()}">
+                        <kbd>${s.key}</kbd>
+                        <span>${s.action}</span>
+                    </div>
+                `).join('')}
+            `;
+
+            // Styles
+            const style = document.createElement('style');
+            style.textContent = `
+                .aw-shortcuts-sidebar {
+                    position: fixed;
+                    left: 20px;
+                    top: 50%;
+                    transform: translateY(-50%);
+                    background: rgba(30, 30, 30, 0.95); /* DARK MODE */
+                    border: 1px solid #444;
+                    border-radius: 12px;
+                    padding: 15px;
+                    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                    z-index: 9999;
+                    font-family: 'Segoe UI', sans-serif;
+                    width: 220px;
+                    transition: opacity 0.3s;
+                    opacity: 0.8; /* Slightly more visible by default */
+                    color: #fff;
+                    backdrop-filter: blur(10px);
+                }
+                .aw-shortcuts-sidebar:hover { opacity: 1; }
+                .aw-shortcut-item {
+                    display: flex;
+                    align-items: center;
+                    margin-bottom: 10px;
+                    font-size: 13px;
+                    color: #ddd;
+                    padding: 6px;
+                    border-radius: 6px;
+                    transition: all 0.2s;
+                    border: 1px solid transparent;
+                }
+                .aw-shortcut-item.active {
+                    background: rgba(59, 130, 246, 0.2);
+                    border-color: rgba(59, 130, 246, 0.5);
+                    color: white;
+                    transform: scale(1.02);
+                }
+                .aw-shortcut-item kbd {
+                    background: #333;
+                    border: 1px solid #555;
+                    border-radius: 4px;
+                    color: #fff;
+                    padding: 3px 8px;
+                    font-family: monospace;
+                    font-size: 12px;
+                    margin-right: 12px;
+                    min-width: 25px;
+                    text-align: center;
+                    box-shadow: 0 2px 0 #111;
+                    font-weight: bold;
+                }
+            `;
+            document.head.appendChild(style);
+            document.body.appendChild(container);
+        }
+
+        startListening() {
+            document.addEventListener('keydown', (e) => {
+                // Ignore input fields
+                if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+
+                const pressed = e.key.toLowerCase();
+                const item = document.querySelector(`.aw-shortcut-item[data-key="${pressed}"]`);
+
+                if (item) {
+                    item.classList.add('active');
+                    setTimeout(() => item.classList.remove('active'), 300);
+                }
+            });
+        }
+    }
+
+    // Init
+    console.log('AdaptiveWeb: Publisher Edition Active');
+    const ui = new UIAdapter();
+    const detector = new BehaviorDetector(ui);
+    detector.initCursorHesitation();
+
+    // Init Shortcuts
+    new ShortcutsManager(new ApiService());
+
+    window.AdaptiveWeb = true;
+
+})();
