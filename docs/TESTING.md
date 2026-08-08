@@ -16,9 +16,14 @@
 - **Limits**: At most two automatic summaries are shown per tab session, with a two-minute cooldown per scroll source.
 
 ### Feature 3: Rapid Skimming
-- **Action**: Scroll quickly (3+ swipes) through a long text area (like the Demo page text).
-- **Expected**: A non-blocking rapid-skim notice appears. After completing the deep scroll-back gesture, long paragraphs use a compact three-line view with independent `Read more` / `Show less` controls.
-- **Verification**: Check for `.aw-scroll-toast.aw-visible`, `.aw-tldr-collapsed`, and `.aw-tldr-read-more`.
+- **Action**: Scroll quickly (3+ fast samples) through a long page or the Demo panel, then stop scrolling for about one second. Do not scroll back to the top.
+- **Expected in Ask mode**: A compact-reading prompt appears with `Compact view`, `Always on this site`, and `Not now`.
+- **Expected in Automatic mode**: Compact reading activates after the idle delay without another prompt.
+- **Verification**: Key-point elements use `.aw-tldr-preview`; preserved original paragraphs have `.aw-tldr-collapsed.aw-tldr-original-hidden`; each paragraph has an accessible `.aw-tldr-read-more` control.
+- **Controls**: Verify individual expansion, `Expand all`, `Key points only`, Ask/Automatic switching, `Disable for this tab`, and `Exit compact view` all preserve or fully restore the original DOM content.
+- **Independence**: Rapid skim alone must offer TL;DR mode. A deep scroll-back must still show its summary but must not activate TL;DR by itself.
+- **Safety checks**: Introductory content, forms, navigation, tables, alerts, editable content and short paragraphs should not be condensed. Dynamically added long paragraphs should be processed once while the mode is active.
+- **Accessibility checks**: Verify `aria-expanded`, `aria-controls`, keyboard focus, Escape dismissal of the prompt and reduced-motion styling.
 
 ### Feature 4: Cursor Hesitation
 - **Stationary action**: Move onto a button, link, choice, or form field and pause for roughly 2–3 seconds.

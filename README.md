@@ -64,8 +64,12 @@ Displays a contextual summary after a meaningful rapid skim and return.
 
 Condenses long content during fast scrolling.
 
-* Trigger: Multiple rapid scroll samples during a deep scroll-back journey
-* Effect: Non-blocking skim notice plus three-line paragraph compaction after the completed gesture, with “Read more” / “Show less” controls
+* Trigger: Three or more rapid scroll samples, followed by a short scrolling pause
+* Independence: Runs separately from the scroll-back summary; returning to the top is not required
+* Effect: Offers a compact reading view with locally selected key-point previews while preserving the original paragraphs
+* Controls: Read individual paragraphs, expand all, return to key points, exit and restore, switch between Ask and Automatic modes, or disable it for the current tab
+* Safety: Skips introductions when enough content exists, forms, navigation, tables, alerts, editable regions and paragraphs dominated by interactive controls
+* Dynamic pages: Processes eligible paragraphs added later without creating duplicate controls
 * Goal: Faster information scanning
 
 ---

@@ -15,6 +15,10 @@
         skimScrollMinSpeed: 800,
         skimEventCount: 3,
         skimTimeWindow: 5000,
+        tldrIdleDelay: 750,
+        tldrMinParagraphChars: 280,
+        tldrMaxParagraphs: 12,
+        tldrDynamicContentDelay: 250,
 
         // Scroll-back auto-summary
         scrollSampleInterval: 60,
@@ -201,6 +205,10 @@
             this.scrollTrackers = new Map();
             this.scrollSummaryInFlight = false;
             this.scrollProgrammaticUntil = 0;
+            this.tldrIdleTimers = new Map();
+            this.tldrSessions = new Map();
+            this.tldrParagraphId = 0;
+            this.activeTldrSource = null;
 
             const handleWindowScroll = (event) => this.handleScrollEvent(window, event);
             const handleCapturedScroll = (event) => {
@@ -214,6 +222,13 @@
             window.addEventListener('pagehide', () => {
                 window.removeEventListener('scroll', handleWindowScroll);
                 document.removeEventListener('scroll', handleCapturedScroll, true);
+                this.tldrIdleTimers.forEach(timer => clearTimeout(timer));
+                this.tldrSessions.forEach(session => {
+                    session.observer?.disconnect();
+                    if (session.observerTimer) clearTimeout(session.observerTimer);
+                });
+                this.tldrIdleTimers.clear();
+                this.tldrSessions.clear();
                 this.scrollTrackers.clear();
             }, { once: true });
         }
@@ -275,6 +290,7 @@
                 fastEvents: [],
                 fastEventTotal: 0,
                 rapidSkimSignaled: false,
+                tldrHandled: false,
                 reachedDeepAt: 0,
                 reachedBottomAt: 0,
                 reversedAt: 0,
@@ -422,6 +438,7 @@
             const now = Date.now();
             if (now < this.scrollProgrammaticUntil) return;
             if (source !== window && this.isAdaptiveWebElement(source)) return;
+            this.ui.dismissTldrPrompt?.('scroll-resumed');
 
             const metrics = this.getScrollMetrics(source);
             if (metrics.range < CONFIG.scrollMinRange) return;
@@ -435,6 +452,7 @@
             const result = this.processScrollSample(tracker, metrics, now);
 
             if (result.rapidSkim) this.onRapidSkimDetected(source, tracker, result.metadata);
+            else if (tracker.rapidSkimSignaled && !tracker.tldrHandled) this.scheduleTldrAssistance(source, tracker);
             if (result.triggerSummary) this.onScrollBackSummaryDetected(source, tracker, result.metadata);
 
             if (source === window) {
@@ -449,7 +467,8 @@
 
         onRapidSkimDetected(source, tracker) {
             if (CONFIG.debug) console.log('Detected: Rapid Skim', { source: source === window ? 'window' : 'container' });
-            this.ui.showScrollToast('Rapid skimming detected. Return near the top for automatic key takeaways.');
+            this.ui.showScrollToast('Rapid skimming detected. Pause to choose a compact reading view.');
+            this.scheduleTldrAssistance(source, tracker);
             this.api.log('rapid_skim_detected', {
                 source_type: source === window ? 'window' : 'container',
                 max_depth: Number(tracker.maxDepth.toFixed(2)),
@@ -466,7 +485,6 @@
             const localSummary = this.buildLocalScrollSummary(summaryText);
             const sourceLabel = source === window ? 'Page' : 'Scrollable section';
             const requestId = this.ui.showScrollSummaryLoading({ sourceLabel, maxDepth: metadata.maxDepth });
-            this.applyRapidSkimMode(source);
             this.api.log('scroll_back_summary', {
                 source_type: source === window ? 'window' : 'container',
                 max_depth: Number(metadata.maxDepth.toFixed(2)),
@@ -593,31 +611,318 @@
             return takeaways.map(item => `- ${item}`).join('\n');
         }
 
-        applyRapidSkimMode(source) {
+        scheduleTldrAssistance(source, tracker) {
+            if (!tracker || tracker.tldrHandled || this.tldrSessions?.get(source)?.active) return;
+            const preference = this.getTldrPreference();
+            if (preference === 'off') {
+                tracker.tldrHandled = true;
+                return;
+            }
+
+            if (!this.tldrIdleTimers) this.tldrIdleTimers = new Map();
+            const existingTimer = this.tldrIdleTimers.get(source);
+            if (existingTimer) clearTimeout(existingTimer);
+            const timer = setTimeout(() => {
+                this.tldrIdleTimers.delete(source);
+                if (tracker.tldrHandled) return;
+                tracker.tldrHandled = true;
+
+                if (preference === 'auto') {
+                    this.applyRapidSkimMode(source, { automatic: true });
+                    return;
+                }
+
+                this.ui.showTldrPrompt({
+                    sourceLabel: source === window ? 'this page' : 'this section',
+                    onApply: () => this.applyRapidSkimMode(source, { automatic: false }),
+                    onAlways: () => {
+                        this.setTldrPreference('auto');
+                        this.applyRapidSkimMode(source, { automatic: true });
+                    },
+                    onDismiss: reason => this.api.log('tldr_prompt_dismissed', {
+                        source_type: source === window ? 'window' : 'container',
+                        reason
+                    })
+                });
+            }, CONFIG.tldrIdleDelay);
+            this.tldrIdleTimers.set(source, timer);
+        }
+
+        getTldrPreference() {
+            try {
+                const domain = window.location?.hostname || 'local';
+                if (sessionStorage.getItem(`aw-tldr-off-v1:${domain}`) === 'true') return 'off';
+                const stored = localStorage.getItem(`aw-tldr-mode-v1:${domain}`);
+                return stored === 'auto' ? 'auto' : 'ask';
+            } catch (error) {
+                return 'ask';
+            }
+        }
+
+        setTldrPreference(mode) {
+            const safeMode = ['ask', 'auto', 'off'].includes(mode) ? mode : 'ask';
+            try {
+                const domain = window.location?.hostname || 'local';
+                const sessionKey = `aw-tldr-off-v1:${domain}`;
+                const persistentKey = `aw-tldr-mode-v1:${domain}`;
+                if (safeMode === 'off') {
+                    sessionStorage.setItem(sessionKey, 'true');
+                } else {
+                    sessionStorage.removeItem(sessionKey);
+                    localStorage.setItem(persistentKey, safeMode);
+                }
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb TL;DR preference could not be saved', error);
+            }
+            return safeMode;
+        }
+
+        applyRapidSkimMode(source, options = {}) {
             const root = source === window
                 ? document.querySelector('main, article') || document.body
                 : source;
-            if (!root || !root.querySelectorAll) return;
-            const paragraphs = Array.from(root.querySelectorAll('p'))
-                .filter(paragraph =>
-                    !this.isAdaptiveWebElement(paragraph) &&
-                    paragraph.dataset.awTldrPrepared !== 'true' &&
-                    (paragraph.innerText || '').trim().length >= 280
-                )
-                .slice(0, 8);
-            paragraphs.forEach(paragraph => {
-                paragraph.dataset.awTldrPrepared = 'true';
-                paragraph.classList.add('aw-tldr-collapsed');
-                const toggle = document.createElement('button');
-                toggle.type = 'button';
-                toggle.className = 'aw-tldr-read-more';
-                toggle.textContent = 'Read more';
-                toggle.addEventListener('click', () => {
-                    const collapsed = paragraph.classList.toggle('aw-tldr-collapsed');
-                    toggle.textContent = collapsed ? 'Read more' : 'Show less';
-                });
-                paragraph.insertAdjacentElement('afterend', toggle);
+            if (!root || !root.querySelectorAll) return false;
+
+            if (!this.tldrSessions) this.tldrSessions = new Map();
+            if (this.activeTldrSource && this.activeTldrSource !== source) {
+                this.restoreRapidSkimMode(this.activeTldrSource, 'source-changed');
+            }
+
+            let session = this.tldrSessions.get(source);
+            if (!session) {
+                session = {
+                    active: true,
+                    source,
+                    root,
+                    entries: new Map(),
+                    automatic: Boolean(options.automatic),
+                    observer: null,
+                    observerTimer: null
+                };
+                this.tldrSessions.set(source, session);
+            }
+            session.active = true;
+            session.automatic = Boolean(options.automatic);
+            this.activeTldrSource = source;
+
+            this.preserveTldrScrollPosition(source, () => this.processTldrCandidates(session));
+            if (session.entries.size === 0) {
+                this.tldrSessions.delete(source);
+                this.activeTldrSource = null;
+                this.ui.showScrollToast('Compact view found no eligible long paragraphs here.');
+                return false;
+            }
+
+            this.observeTldrDynamicContent(session);
+            this.showTldrToolbar(session);
+            this.api.log('tldr_mode_applied', {
+                source_type: source === window ? 'window' : 'container',
+                paragraph_count: session.entries.size,
+                mode: session.automatic ? 'automatic' : 'confirmed'
             });
+            return true;
+        }
+
+        processTldrCandidates(session) {
+            if (!session?.active) return 0;
+            const remaining = Math.max(0, CONFIG.tldrMaxParagraphs - session.entries.size);
+            if (remaining === 0) return 0;
+            const candidates = this.getTldrCandidates(session.root)
+                .filter(paragraph => !session.entries.has(paragraph))
+                .slice(0, remaining);
+            candidates.forEach(paragraph => this.prepareTldrParagraph(paragraph, session));
+            return candidates.length;
+        }
+
+        getTldrCandidates(root) {
+            if (!root?.querySelectorAll) return [];
+            const candidates = Array.from(root.querySelectorAll('p')).filter(paragraph => {
+                const text = String(paragraph.innerText || paragraph.textContent || '').replace(/\s+/g, ' ').trim();
+                if (text.length < CONFIG.tldrMinParagraphChars) return false;
+                if (this.isAdaptiveWebElement(paragraph) || paragraph.dataset?.awTldrPrepared === 'true') return false;
+                if (paragraph.closest?.('form, nav, table, details, [role="alert"], [aria-live], [contenteditable="true"]')) return false;
+                if (paragraph.matches?.('.lead, .intro, .summary, [data-no-tldr]')) return false;
+                if (/^(warning|important|conclusion|key takeaway|summary)\b/i.test(text)) return false;
+                const interactiveCount = paragraph.querySelectorAll?.('a, button, input, select, textarea').length || 0;
+                return interactiveCount <= 2;
+            });
+            return candidates.length > 2 ? candidates.slice(1) : candidates;
+        }
+
+        selectTldrKeySentence(text) {
+            const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+            const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+            if (sentences.length === 0) return normalized.slice(0, 240);
+            let best = sentences[0].trim();
+            let bestScore = -Infinity;
+            sentences.slice(0, 12).forEach((rawSentence, index) => {
+                const sentence = rawSentence.trim();
+                const length = sentence.length;
+                let score = -index * 0.2;
+                if (length >= 70 && length <= 220) score += 4;
+                else if (length >= 45 && length <= 260) score += 2;
+                if (/\b(because|therefore|means|allows|helps|ensures|important|key|result|provides)\b/i.test(sentence)) score += 2;
+                if (/\d|%/.test(sentence)) score += 0.5;
+                if (/\b(click|scroll|instruction|try|demo)\b/i.test(sentence)) score -= 2;
+                if (score > bestScore) {
+                    best = sentence;
+                    bestScore = score;
+                }
+            });
+            return best.slice(0, 260);
+        }
+
+        prepareTldrParagraph(paragraph, session) {
+            if (!paragraph || session.entries.has(paragraph)) return null;
+            const originalId = paragraph.id || '';
+            if (!paragraph.id) {
+                this.tldrParagraphId = (this.tldrParagraphId || 0) + 1;
+                paragraph.id = `aw-tldr-paragraph-${this.tldrParagraphId}`;
+            }
+            paragraph.dataset.awTldrPrepared = 'true';
+
+            const preview = document.createElement('p');
+            preview.className = 'aw-tldr-preview';
+            preview.setAttribute('data-aw-tldr-for', paragraph.id);
+            const label = document.createElement('span');
+            label.className = 'aw-tldr-preview-label';
+            label.textContent = 'Key point';
+            const previewText = document.createElement('span');
+            previewText.textContent = this.selectTldrKeySentence(paragraph.innerText || paragraph.textContent || '');
+            preview.append(label, previewText);
+
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'aw-tldr-read-more';
+            toggle.setAttribute('aria-controls', paragraph.id);
+
+            const entry = { paragraph, preview, toggle, originalId, expanded: false };
+            toggle.addEventListener('click', () => this.setTldrEntryExpanded(entry, !entry.expanded));
+            paragraph.insertAdjacentElement('beforebegin', preview);
+            paragraph.insertAdjacentElement('afterend', toggle);
+            session.entries.set(paragraph, entry);
+            this.setTldrEntryExpanded(entry, false);
+            return entry;
+        }
+
+        setTldrEntryExpanded(entry, expanded) {
+            if (!entry) return;
+            entry.expanded = Boolean(expanded);
+            if (entry.expanded) {
+                entry.paragraph.classList.remove('aw-tldr-collapsed', 'aw-tldr-original-hidden');
+                entry.paragraph.removeAttribute('aria-hidden');
+                entry.preview.hidden = true;
+                entry.toggle.textContent = 'Show key point';
+            } else {
+                entry.paragraph.classList.add('aw-tldr-collapsed', 'aw-tldr-original-hidden');
+                entry.paragraph.setAttribute('aria-hidden', 'true');
+                entry.preview.hidden = false;
+                entry.toggle.textContent = 'Read full paragraph';
+            }
+            entry.toggle.setAttribute('aria-expanded', String(entry.expanded));
+        }
+
+        setAllTldrEntries(source, expanded) {
+            const session = this.tldrSessions?.get(source);
+            if (!session) return;
+            this.preserveTldrScrollPosition(source, () => {
+                session.entries.forEach(entry => this.setTldrEntryExpanded(entry, expanded));
+            });
+            this.api.log(expanded ? 'tldr_expand_all' : 'tldr_collapse_all', {
+                paragraph_count: session.entries.size
+            });
+        }
+
+        restoreTldrEntry(entry) {
+            if (!entry) return;
+            entry.paragraph.classList.remove('aw-tldr-collapsed', 'aw-tldr-original-hidden');
+            entry.paragraph.removeAttribute('aria-hidden');
+            if (entry.paragraph.dataset) delete entry.paragraph.dataset.awTldrPrepared;
+            if (!entry.originalId) entry.paragraph.removeAttribute('id');
+            entry.preview.remove();
+            entry.toggle.remove();
+        }
+
+        restoreRapidSkimMode(source, reason = 'exit') {
+            const session = this.tldrSessions?.get(source);
+            if (!session) return false;
+            session.active = false;
+            session.observer?.disconnect();
+            if (session.observerTimer) clearTimeout(session.observerTimer);
+            this.preserveTldrScrollPosition(source, () => {
+                session.entries.forEach(entry => this.restoreTldrEntry(entry));
+            });
+            session.entries.clear();
+            this.tldrSessions.delete(source);
+            if (this.activeTldrSource === source) this.activeTldrSource = null;
+            this.ui.removeTldrToolbar();
+            this.api.log('tldr_mode_restored', { reason });
+            return true;
+        }
+
+        showTldrToolbar(session) {
+            const preference = this.getTldrPreference();
+            this.ui.showTldrToolbar({
+                count: session.entries.size,
+                sourceLabel: session.source === window ? 'Page' : 'Section',
+                preference,
+                onExpandAll: () => this.setAllTldrEntries(session.source, true),
+                onCollapseAll: () => this.setAllTldrEntries(session.source, false),
+                onPreference: mode => {
+                    this.setTldrPreference(mode);
+                    session.automatic = mode === 'auto';
+                    this.showTldrToolbar(session);
+                },
+                onDisable: () => {
+                    this.setTldrPreference('off');
+                    this.restoreRapidSkimMode(session.source, 'disabled-for-tab');
+                    this.ui.showScrollToast('Compact reading is disabled for this site in this tab.');
+                },
+                onExit: () => this.restoreRapidSkimMode(session.source, 'user-exit')
+            });
+        }
+
+        observeTldrDynamicContent(session) {
+            if (session.observer || typeof MutationObserver !== 'function') return;
+            session.observer = new MutationObserver(mutations => {
+                const hasNewContent = mutations.some(mutation => Array.from(mutation.addedNodes || []).some(node =>
+                    node.nodeType === 1 && (node.matches?.('p') || node.querySelector?.('p'))
+                ));
+                if (!hasNewContent) return;
+                if (session.observerTimer) clearTimeout(session.observerTimer);
+                session.observerTimer = setTimeout(() => {
+                    if (!session.active) return;
+                    this.preserveTldrScrollPosition(session.source, () => this.processTldrCandidates(session));
+                    this.showTldrToolbar(session);
+                }, CONFIG.tldrDynamicContentDelay);
+            });
+            session.observer.observe(session.root, { childList: true, subtree: true });
+        }
+
+        preserveTldrScrollPosition(source, mutate) {
+            if (typeof mutate !== 'function') return;
+            let before;
+            try {
+                before = this.getScrollMetrics(source);
+            } catch (error) {
+                before = null;
+            }
+            mutate();
+            if (!before || before.range <= 0) return;
+            let after;
+            try {
+                after = this.getScrollMetrics(source);
+            } catch (error) {
+                return;
+            }
+            const targetPosition = before.depth * after.range;
+            if (!Number.isFinite(targetPosition) || Math.abs(targetPosition - after.position) < 4) return;
+            this.scrollProgrammaticUntil = Date.now() + 300;
+            if (source === window && typeof window.scrollTo === 'function') {
+                window.scrollTo(0, targetPosition);
+            } else if (source && typeof source.scrollTop === 'number') {
+                source.scrollTop = targetPosition;
+            }
         }
 
         scrollSourceToStart(source) {
@@ -1517,6 +1822,9 @@
                 '.aw-suggestion-bubble',
                 '.aw-summary-box',
                 '.aw-scroll-toast',
+                '.aw-tldr-prompt',
+                '.aw-tldr-toolbar',
+                '.aw-tldr-preview',
                 '.aw-takeaways',
                 '.aw-sidebar',
                 '.aw-shortcuts-sidebar',
@@ -1958,6 +2266,8 @@
         constructor() {
             this.scrollSummaryRequestId = 0;
             this.currentScrollSummaryBox = null;
+            this.currentTldrPrompt = null;
+            this.currentTldrToolbar = null;
             this.injectStyles();
         }
 
@@ -2233,6 +2543,125 @@
                 toast.classList.remove('aw-visible');
                 setTimeout(() => toast.remove(), 220);
             }, 4200);
+        }
+
+        showTldrPrompt({ sourceLabel, onApply, onAlways, onDismiss }) {
+            this.dismissTldrPrompt('replaced');
+            document.querySelector('.aw-scroll-toast')?.remove();
+
+            const prompt = document.createElement('aside');
+            prompt.className = 'aw-tldr-prompt';
+            prompt.setAttribute('role', 'dialog');
+            prompt.setAttribute('aria-modal', 'false');
+            prompt.setAttribute('aria-label', 'Compact reading suggestion');
+            const heading = document.createElement('strong');
+            heading.className = 'aw-tldr-prompt-heading';
+            heading.textContent = 'Make this easier to skim?';
+            const message = document.createElement('p');
+            message.textContent = `AdaptiveWeb can condense long paragraphs in ${String(sourceLabel || 'this content')} into local key points.`;
+            const actions = document.createElement('div');
+            actions.className = 'aw-tldr-prompt-actions';
+
+            const apply = document.createElement('button');
+            apply.type = 'button';
+            apply.className = 'aw-tldr-primary';
+            apply.textContent = 'Compact view';
+            const always = document.createElement('button');
+            always.type = 'button';
+            always.className = 'aw-tldr-secondary';
+            always.textContent = 'Always on this site';
+            const dismissButton = document.createElement('button');
+            dismissButton.type = 'button';
+            dismissButton.className = 'aw-tldr-quiet';
+            dismissButton.textContent = 'Not now';
+            actions.append(apply, always, dismissButton);
+
+            const privacy = document.createElement('small');
+            privacy.className = 'aw-tldr-prompt-note';
+            privacy.textContent = 'Key points are selected locally. Original page content is preserved.';
+            prompt.append(heading, message, actions, privacy);
+            document.body.appendChild(prompt);
+
+            let settled = false;
+            let timeoutId;
+            const escapeHandler = event => {
+                if (event.key === 'Escape') dismiss('escape');
+            };
+            const dismiss = (reason, action) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                document.removeEventListener('keydown', escapeHandler, true);
+                prompt.classList.remove('aw-visible');
+                setTimeout(() => prompt.remove(), 200);
+                this.currentTldrPrompt = null;
+                if (typeof action === 'function') action();
+                else if (typeof onDismiss === 'function') onDismiss(reason);
+            };
+            this.currentTldrPrompt = { element: prompt, dismiss };
+            apply.addEventListener('click', () => dismiss('apply', onApply));
+            always.addEventListener('click', () => dismiss('always', onAlways));
+            dismissButton.addEventListener('click', () => dismiss('not-now'));
+            document.addEventListener('keydown', escapeHandler, true);
+            requestAnimationFrame(() => prompt.classList.add('aw-visible'));
+            timeoutId = setTimeout(() => dismiss('timeout'), 12000);
+            apply.focus({ preventScroll: true });
+            return true;
+        }
+
+        dismissTldrPrompt(reason = 'dismissed') {
+            if (!this.currentTldrPrompt) return false;
+            this.currentTldrPrompt.dismiss(reason);
+            return true;
+        }
+
+        showTldrToolbar({ count, sourceLabel, preference, onExpandAll, onCollapseAll, onPreference, onDisable, onExit }) {
+            this.removeTldrToolbar();
+            const toolbar = document.createElement('aside');
+            toolbar.className = 'aw-tldr-toolbar';
+            toolbar.setAttribute('role', 'region');
+            toolbar.setAttribute('aria-label', 'Compact reading controls');
+
+            const header = document.createElement('div');
+            header.className = 'aw-tldr-toolbar-header';
+            const heading = document.createElement('strong');
+            heading.textContent = 'Compact reading';
+            const status = document.createElement('span');
+            status.textContent = `${Number(count || 0)} paragraphs condensed · ${String(sourceLabel || 'Page')}`;
+            header.append(heading, status);
+
+            const controls = document.createElement('div');
+            controls.className = 'aw-tldr-toolbar-controls';
+            const createControl = (label, className, handler) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = className;
+                button.textContent = label;
+                button.addEventListener('click', handler);
+                return button;
+            };
+            controls.append(
+                createControl('Expand all', 'aw-tldr-secondary', onExpandAll),
+                createControl('Key points only', 'aw-tldr-secondary', onCollapseAll),
+                createControl(
+                    preference === 'auto' ? 'Use Ask mode' : 'Make automatic',
+                    'aw-tldr-secondary',
+                    () => onPreference(preference === 'auto' ? 'ask' : 'auto')
+                ),
+                createControl('Disable for this tab', 'aw-tldr-quiet', onDisable),
+                createControl('Exit compact view', 'aw-tldr-primary', onExit)
+            );
+            toolbar.append(header, controls);
+            document.body.appendChild(toolbar);
+            this.currentTldrToolbar = toolbar;
+            requestAnimationFrame(() => toolbar.classList.add('aw-visible'));
+            return toolbar;
+        }
+
+        removeTldrToolbar() {
+            if (!this.currentTldrToolbar) return;
+            this.currentTldrToolbar.remove();
+            this.currentTldrToolbar = null;
         }
 
         createScrollSummaryShell({ sourceLabel, maxDepth }) {

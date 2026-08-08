@@ -165,7 +165,8 @@ export default function Home() {
                 ))}
               </div>
               <p className="mt-4 text-sm text-slate-500">
-                Test: scroll quickly past at least 85% of this panel, then return above 20% within 18 seconds. The summary should appear automatically and label Gemini or Local summary clearly.
+                TL;DR test: scroll quickly through at least three movements, stop for about one second, and choose Compact view—no scroll-back is required. <br />
+                Summary test: continue past 85%, then return above 20% within 18 seconds. The summary remains a separate feature.
               </p>
             </div>
 
