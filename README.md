@@ -49,11 +49,14 @@ Highlights content the user is actively reading.
 
 ### 📋 Scroll-Back Auto Summary
 
-Displays a contextual summary when users scroll back.
+Displays a contextual summary after a meaningful rapid skim and return.
 
-* Trigger: Scroll down → quick scroll up
-* Effect: Floating summary overlay
-* Goal: Reduce re-reading effort
+* Trigger: Reach at least **85% depth**, then return above **20%** within the guarded gesture windows
+* Coverage: Works on the main page and nested scrollable containers
+* Effect: Accessible pinned panel with three takeaways, depth metadata, dismiss, and read-from-start controls
+* Reliability: Signed direction tracking, travel thresholds, timing windows, cooldowns, and two prompts per tab session reduce false positives
+* Fallback: Uses Gemini when available and a clearly labeled local extractive summary when it is not
+* Privacy: Samples bounded visible content, removes duplicates, and redacts common email, phone, and long-number patterns
 
 ---
 
@@ -61,8 +64,8 @@ Displays a contextual summary when users scroll back.
 
 Condenses long content during fast scrolling.
 
-* Trigger: Multiple rapid scrolls
-* Effect: Paragraphs collapse with “Read more”
+* Trigger: Multiple rapid scroll samples during a deep scroll-back journey
+* Effect: Non-blocking skim notice plus three-line paragraph compaction after the completed gesture, with “Read more” / “Show less” controls
 * Goal: Faster information scanning
 
 ---
@@ -172,7 +175,7 @@ cd adaptiveweb
 1. Open `chrome://extensions`
 2. Enable **Developer Mode**
 3. Click **Load unpacked**
-4. Select the `extension/` directory
+4. Select the repository root (the folder containing `manifest.json`)
 
 ✅ AdaptiveWeb activates automatically on all pages.
 
@@ -180,18 +183,7 @@ cd adaptiveweb
 
 ## ⚙️ Configuration
 
-```js
-window.AdaptiveWeb.init({
-  hoverDelay: 1500,
-  highlightDuration: 3000,
-  scrollBackWindow: 3000,
-  skimScrollCount: 3,
-  tldrLength: 120,
-  cursorBufferSize: 20,
-  varianceThreshold: 5000,
-  debug: false
-});
-```
+Behavior thresholds are currently defined in the extension's `CONFIG` object in `injected.js`. Reload the unpacked extension after changing them.
 
 ---
 
@@ -219,10 +211,7 @@ window.AdaptiveWeb.init({
 
 ## 🧪 Testing
 
-```bash
-cd demo
-python -m http.server 8000
-```
+Run the frontend demo with `npm run dev` from `frontend`, start the FastAPI backend, and reload the unpacked extension after source changes. Detailed manual checks are in `docs/TESTING.md`.
 
 Test scenarios:
 

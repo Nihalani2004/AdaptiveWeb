@@ -8,14 +8,17 @@
 - **Verification**: Check `injected.css` class `.aw-highlighted` is applied.
 
 ### Feature 2: Scroll-Back Summary
-- **Action**: Scroll down at least 100px deep into a page. Then immediately scroll up within 3 seconds.
-- **Expected**: A summary box appears in the top right.
-- **Verification**: Check element `.aw-summary-box` exists in DOM.
+- **Action**: On a page or nested panel with at least 480 px of scrollable range, scroll quickly past 85% depth and return above 20% depth within 18 seconds.
+- **Expected**: A visible, pinned summary box appears with the maximum depth, three takeaways, and a `Gemini summary` or `Local summary` source badge.
+- **Verification**: Check `.aw-summary-box.aw-visible` exists, computed opacity is `1`, and the content came from text visited during the gesture. The `Read from start` action should return the correct page or nested panel to its beginning.
+- **False-positive checks**: A shallow return, a slow deep read, text selection, active media, a hidden tab, and repeated attempts during cooldown must not show another summary.
+- **Fallback**: Stop the backend and repeat the gesture. The loading state must resolve to a clearly labeled `Local summary` without breaking the page.
+- **Limits**: At most two automatic summaries are shown per tab session, with a two-minute cooldown per scroll source.
 
 ### Feature 3: Rapid Skimming
 - **Action**: Scroll quickly (3+ swipes) through a long text area (like the Demo page text).
-- **Expected**: Long paragraphs collapse with "...read more".
-- **Verification**: Check for `.aw-tldr-collapsed` class.
+- **Expected**: A non-blocking rapid-skim notice appears. After completing the deep scroll-back gesture, long paragraphs use a compact three-line view with independent `Read more` / `Show less` controls.
+- **Verification**: Check for `.aw-scroll-toast.aw-visible`, `.aw-tldr-collapsed`, and `.aw-tldr-read-more`.
 
 ### Feature 4: Cursor Hesitation
 - **Stationary action**: Move onto a button, link, choice, or form field and pause for roughly 2–3 seconds.

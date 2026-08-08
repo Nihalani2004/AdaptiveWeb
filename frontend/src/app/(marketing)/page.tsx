@@ -1,10 +1,20 @@
 'use client';
 
 import React, { useState } from 'react';
-import { ArrowRight, MousePointer2, Scroll, Eye, Zap, Download } from 'lucide-react';
-import { motion } from 'framer-motion';
+import { MousePointer2, Scroll, Eye, Zap } from 'lucide-react';
 
-import Link from 'next/link';
+const scrollDemoSections = [
+  ['Intent signals', 'AdaptiveWeb observes interaction patterns such as scroll direction, distance, speed, and reversals. A single fast wheel event is not enough to trigger help. The extension waits for a meaningful journey through the content so ordinary navigation does not cause an interruption.'],
+  ['Deep-reading threshold', 'The detector measures progress against the actual scrollable range. It considers the journey deep only after the reader reaches most of the document or scrollable panel, which distinguishes a quick glance at the opening from a genuine skim through the material.'],
+  ['Bottom confirmation', 'Reaching the lower portion of the content arms the scroll-back detector. The extension records the maximum depth, downward travel, and timing locally. It does not need to record raw mouse coordinates or a replay of the browsing session.'],
+  ['Direction reversal', 'After reaching the bottom region, an upward movement starts a return window. Small corrections are tolerated, but the reader must travel a substantial distance toward the beginning before the extension treats the gesture as a deliberate scroll-back.'],
+  ['Skimming confidence', 'Scroll speed is only one part of the decision. AdaptiveWeb combines several fast samples with total travel and gesture duration. This reduces false positives caused by touchpad noise, layout shifts, or a user moving only a few pixels.'],
+  ['Visited content', 'While the user scrolls, the extension samples visible headings, paragraphs, and list items. Duplicate snippets are removed, sensitive patterns such as email addresses and long numbers are redacted, and the total context sent for summarization is strictly bounded.'],
+  ['Automatic takeaways', 'When the user returns near the beginning within the allowed time window, a pinned summary appears. It shows three concise takeaways, the maximum depth reached, and whether the result came from Gemini or from the on-device local fallback.'],
+  ['Reliable fallback', 'If the backend is stopped, the network is slow, or Gemini cannot answer, the feature still produces a local extractive summary from the visited content. The source badge makes this fallback explicit instead of presenting local text as an AI response.'],
+  ['Reader control', 'The summary never takes over the page. The reader can dismiss it, continue where they are, or choose Read from start to return smoothly to the beginning of the page or nested scrollable panel. Repeated prompts are limited per session.'],
+  ['Accessibility and privacy', 'The panel uses an accessible dialog label, live status updates, keyboard-focusable actions, high contrast, and reduced-motion support. Content is collected only for this assistance flow and analytics contain aggregate measurements rather than the article text itself.']
+] as const;
 
 export default function Home() {
   const [email, setEmail] = useState('');
@@ -123,7 +133,7 @@ export default function Home() {
                     cursor-help"
                   id="hover-target"
                 >
-                  Adaptive interfaces represent the next evolution of web design. Unlike static pages that treat every user the same, an adaptive system detects your intent in real-time. By analyzing micro-interactions—like how long you hesitate on a paragraph or how quickly you scroll—the interface restructures itself to match your cognitive state. This ensures you get detailed explanations when you're confused and concise summaries when you're rushing.
+                  Adaptive interfaces represent the next evolution of web design. Unlike static pages that treat every user the same, an adaptive system detects your intent in real-time. By analyzing micro-interactions—like how long you hesitate on a paragraph or how quickly you scroll—the interface restructures itself to match your cognitive state. This ensures you get detailed explanations when you’re confused and concise summaries when you’re rushing.
                 </p>
               </div>
             </div>
@@ -136,27 +146,26 @@ export default function Home() {
                 </div>
                 <div>
                   <h3 className="text-2xl font-bold">2. Scroll Dynamics Test</h3>
-                  <p className="text-slate-500">Test "Scroll Back Summary" and "Rapid Skim" here.</p>
+                  <p className="text-slate-500">Test “Scroll Back Summary” and “Rapid Skim” here.</p>
                 </div>
               </div>
 
               <div className="h-96 overflow-y-auto border border-slate-200 rounded-xl p-6 bg-slate-50 dark:bg-slate-900" id="scroll-container">
                 <p className="mb-4 font-medium text-slate-500">--- Start Scrolling Down ---</p>
-                {Array.from({ length: 10 }).map((_, i) => (
-                  <div key={i} className="mb-8">
-                    <h4 className="text-xl font-bold mb-2">Section {i + 1}: Detailed Analysis of User Behavior</h4>
+                {scrollDemoSections.map(([title, description], i) => (
+                  <div key={title} className="mb-8">
+                    <h4 className="text-xl font-bold mb-2">Section {i + 1}: {title}</h4>
                     <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
-                      Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. This paragraph is intentionally long to trigger the skimming detection if you scroll past it very quickly. Try scrolling up and down rapidly to see if the interface adapts.
+                      {description} This section is intentionally detailed enough to make a fast skim measurable while keeping the demonstration readable and meaningful.
                     </p>
                     <p className="mt-2 text-slate-600 dark:text-slate-300 leading-relaxed">
-                      Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit.
+                      Verification note: move quickly through this section, reach the lower end of the panel, and then return near the beginning without waiting too long. Normal slow reading should not open the automatic summary.
                     </p>
                   </div>
                 ))}
               </div>
               <p className="mt-4 text-sm text-slate-500">
-                Instruction: 1. Scroll down deep. 2. Stop. 3. Scroll back up quickly. (Should see Summary Box). <br />
-                Instruction: Scroll fast through the list to trigger TL;DR collapse.
+                Test: scroll quickly past at least 85% of this panel, then return above 20% within 18 seconds. The summary should appear automatically and label Gemini or Local summary clearly.
               </p>
             </div>
 

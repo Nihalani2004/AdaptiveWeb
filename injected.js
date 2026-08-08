@@ -16,6 +16,23 @@
         skimEventCount: 3,
         skimTimeWindow: 5000,
 
+        // Scroll-back auto-summary
+        scrollSampleInterval: 60,
+        scrollMinRange: 480,
+        scrollDeepThreshold: 0.72,
+        scrollBottomThreshold: 0.85,
+        scrollReturnThreshold: 0.2,
+        scrollMinTravelRatio: 0.55,
+        scrollMinReturnRatio: 0.45,
+        scrollReverseWindow: 12000,
+        scrollReturnWindow: 18000,
+        scrollGestureWindow: 45000,
+        scrollIdleReset: 8000,
+        scrollSummaryCooldown: 120000,
+        scrollSummarySessionLimit: 2,
+        scrollContentSampleInterval: 250,
+        scrollContentMaxChars: 6000,
+
         // Feature 4: Exit Intent
         exitThresholdY: 50,
 
@@ -177,59 +194,461 @@
             this.api.log('reading_difficulty', { text_len: p.innerText.length });
         }
 
-        // --- Feature 2 & 3: Scroll Analysis (Engaged & Skimmer) ---
+        // --- Feature 2 & 3: Scroll-back Summary, Rapid Skim, and Engaged Reader ---
         initScrollAnalysis() {
-            let lastScrollY = window.scrollY;
-            let lastScrollTime = Date.now();
-            let scrollEvents = []; // {time, speed}
+            if (this.scrollAnalysisInitialized) return;
+            this.scrollAnalysisInitialized = true;
+            this.scrollTrackers = new Map();
+            this.scrollSummaryInFlight = false;
+            this.scrollProgrammaticUntil = 0;
 
-            window.addEventListener('scroll', () => {
-                const now = Date.now();
-                const currentY = window.scrollY;
-                const dt = now - lastScrollTime;
+            const handleWindowScroll = (event) => this.handleScrollEvent(window, event);
+            const handleCapturedScroll = (event) => {
+                const source = this.getScrollSource(event.target);
+                if (source !== window) this.handleScrollEvent(source, event);
+            };
 
-                if (dt > 100) { // Check every 100ms
-                    const dy = Math.abs(currentY - lastScrollY);
-                    const speed = (dy / dt) * 1000; // px/sec
+            window.addEventListener('scroll', handleWindowScroll, { passive: true });
+            document.addEventListener('scroll', handleCapturedScroll, { passive: true, capture: true });
 
-                    this.checkSkimmer(now, speed, scrollEvents);
-                    this.checkEngaged(now, speed, currentY);
-
-                    lastScrollY = currentY;
-                    lastScrollTime = now;
-                }
-            }, { passive: true });
+            window.addEventListener('pagehide', () => {
+                window.removeEventListener('scroll', handleWindowScroll);
+                document.removeEventListener('scroll', handleCapturedScroll, true);
+                this.scrollTrackers.clear();
+            }, { once: true });
         }
 
-        checkSkimmer(now, speed, events) {
-            if (speed > CONFIG.skimScrollMinSpeed) {
-                events.push(now);
-                // Clean old
-                while (events.length > 0 && now - events[0] > CONFIG.skimTimeWindow) {
-                    events.shift();
-                }
+        getScrollSource(target) {
+            if (!target || target === document || target === document.documentElement || target === document.body) {
+                return window;
+            }
+            return target && typeof target.scrollTop === 'number' ? target : window;
+        }
 
-                if (events.length >= CONFIG.skimEventCount) {
-                    this.onSkimmerDetected();
-                    // Reset to avoid spam
-                    events.length = 0;
+        getScrollMetrics(source) {
+            if (source === window) {
+                const scrollingElement = document.scrollingElement || document.documentElement;
+                const scrollHeight = Math.max(
+                    scrollingElement?.scrollHeight || 0,
+                    document.documentElement?.scrollHeight || 0,
+                    document.body?.scrollHeight || 0
+                );
+                const viewportSize = Math.max(1, window.innerHeight || scrollingElement?.clientHeight || 1);
+                const range = Math.max(0, scrollHeight - viewportSize);
+                const position = Math.max(0, window.scrollY || scrollingElement?.scrollTop || 0);
+                return {
+                    position,
+                    viewportSize,
+                    scrollHeight,
+                    range,
+                    depth: range > 0 ? Math.max(0, Math.min(1, position / range)) : 0
+                };
+            }
+
+            const viewportSize = Math.max(1, source.clientHeight || 1);
+            const scrollHeight = Math.max(viewportSize, source.scrollHeight || viewportSize);
+            const range = Math.max(0, scrollHeight - viewportSize);
+            const position = Math.max(0, source.scrollTop || 0);
+            return {
+                position,
+                viewportSize,
+                scrollHeight,
+                range,
+                depth: range > 0 ? Math.max(0, Math.min(1, position / range)) : 0
+            };
+        }
+
+        createScrollTracker(metrics, now = Date.now()) {
+            return {
+                state: 'idle',
+                lastPosition: metrics.position,
+                lastTime: now,
+                lastActiveAt: now,
+                lastRange: metrics.range,
+                startedAt: 0,
+                startPosition: metrics.position,
+                maxPosition: metrics.position,
+                maxDepth: metrics.depth,
+                totalDownward: 0,
+                totalUpward: 0,
+                totalDistance: 0,
+                fastEvents: [],
+                fastEventTotal: 0,
+                rapidSkimSignaled: false,
+                reachedDeepAt: 0,
+                reachedBottomAt: 0,
+                reversedAt: 0,
+                contentSnippets: new Map(),
+                lastContentAt: 0,
+                cooldownUntil: 0,
+                triggered: false
+            };
+        }
+
+        resetScrollTracker(tracker, metrics, now = Date.now(), preserveCooldown = false) {
+            const cooldownUntil = preserveCooldown ? tracker.cooldownUntil : 0;
+            const fresh = this.createScrollTracker(metrics, now);
+            Object.assign(tracker, fresh, {
+                state: preserveCooldown && cooldownUntil > now ? 'cooldown' : 'idle',
+                cooldownUntil
+            });
+            return tracker;
+        }
+
+        processScrollSample(tracker, metrics, now = Date.now()) {
+            const result = { rapidSkim: false, triggerSummary: false };
+            if (!tracker || !metrics || metrics.range < CONFIG.scrollMinRange) return result;
+
+            if (tracker.lastRange > 0 && Math.abs(metrics.range - tracker.lastRange) / tracker.lastRange > 0.35) {
+                this.resetScrollTracker(tracker, metrics, now);
+                return result;
+            }
+            tracker.lastRange = metrics.range;
+
+            if (tracker.state === 'cooldown') {
+                tracker.lastPosition = metrics.position;
+                tracker.lastTime = now;
+                if (now < tracker.cooldownUntil) return result;
+                this.resetScrollTracker(tracker, metrics, now);
+                return result;
+            }
+
+            const elapsed = now - tracker.lastTime;
+            const delta = metrics.position - tracker.lastPosition;
+            if (elapsed < CONFIG.scrollSampleInterval) return result;
+            tracker.lastPosition = metrics.position;
+            tracker.lastTime = now;
+            if (Math.abs(delta) < 2) return result;
+
+            if (
+                tracker.state !== 'idle' &&
+                tracker.state !== 'bottom' &&
+                tracker.state !== 'returning' &&
+                now - tracker.lastActiveAt > CONFIG.scrollIdleReset
+            ) {
+                this.resetScrollTracker(tracker, metrics, now);
+            }
+            tracker.lastActiveAt = now;
+
+            const direction = delta > 0 ? 'down' : 'up';
+            const distance = Math.abs(delta);
+            const speed = (distance / Math.max(elapsed, 1)) * 1000;
+
+            if (tracker.state === 'idle') {
+                if (direction !== 'down') return result;
+                tracker.state = 'descending';
+                tracker.startedAt = now;
+                tracker.startPosition = Math.max(0, metrics.position - Math.max(delta, 0));
+                tracker.maxPosition = metrics.position;
+                tracker.maxDepth = metrics.depth;
+            }
+
+            tracker.totalDistance += distance;
+            if (speed >= CONFIG.skimScrollMinSpeed) {
+                tracker.fastEvents.push(now);
+                tracker.fastEventTotal += 1;
+            }
+            tracker.fastEvents = tracker.fastEvents.filter(time => now - time <= CONFIG.skimTimeWindow);
+            if (!tracker.rapidSkimSignaled && tracker.fastEvents.length >= CONFIG.skimEventCount) {
+                tracker.rapidSkimSignaled = true;
+                result.rapidSkim = true;
+            }
+
+            if (direction === 'down') {
+                tracker.totalDownward += distance;
+                tracker.maxPosition = Math.max(tracker.maxPosition, metrics.position);
+                tracker.maxDepth = Math.max(tracker.maxDepth, metrics.depth);
+
+                if (tracker.state === 'returning' && distance > Math.max(60, metrics.range * 0.08)) {
+                    tracker.state = tracker.maxDepth >= CONFIG.scrollBottomThreshold ? 'bottom' : 'deep';
+                    tracker.reversedAt = 0;
+                    tracker.totalUpward = 0;
                 }
+                if (tracker.maxDepth >= CONFIG.scrollDeepThreshold && !tracker.reachedDeepAt) {
+                    tracker.reachedDeepAt = now;
+                    tracker.state = 'deep';
+                }
+                if (tracker.maxDepth >= CONFIG.scrollBottomThreshold) {
+                    if (!tracker.reachedBottomAt) tracker.reachedBottomAt = now;
+                    tracker.state = 'bottom';
+                }
+                return result;
+            }
+
+            if (!tracker.reachedBottomAt || tracker.maxDepth < CONFIG.scrollBottomThreshold) return result;
+            if (now - tracker.reachedBottomAt > CONFIG.scrollReverseWindow && !tracker.reversedAt) {
+                this.resetScrollTracker(tracker, metrics, now);
+                return result;
+            }
+            if (!tracker.reversedAt) {
+                tracker.reversedAt = now;
+                tracker.state = 'returning';
+            }
+            tracker.totalUpward += distance;
+
+            const downwardTravelRatio = Math.max(0, tracker.maxPosition - tracker.startPosition) / metrics.range;
+            const returnTravelRatio = Math.max(0, tracker.maxPosition - metrics.position) / metrics.range;
+            const gestureDuration = now - tracker.startedAt;
+            const returnDuration = now - tracker.reversedAt;
+            const averageSpeed = tracker.totalDistance / Math.max(gestureDuration / 1000, 0.001);
+            const skimConfirmed = tracker.rapidSkimSignaled || averageSpeed >= 450;
+
+            if (
+                metrics.depth <= CONFIG.scrollReturnThreshold &&
+                downwardTravelRatio >= CONFIG.scrollMinTravelRatio &&
+                returnTravelRatio >= CONFIG.scrollMinReturnRatio &&
+                returnDuration <= CONFIG.scrollReturnWindow &&
+                gestureDuration <= CONFIG.scrollGestureWindow &&
+                skimConfirmed
+            ) {
+                result.triggerSummary = true;
+                result.metadata = {
+                    maxDepth: tracker.maxDepth,
+                    downwardTravelRatio,
+                    returnTravelRatio,
+                    gestureDuration,
+                    returnDuration,
+                    averageSpeed,
+                    fastEventTotal: tracker.fastEventTotal
+                };
+                tracker.triggered = true;
+                tracker.state = 'cooldown';
+                tracker.cooldownUntil = now + CONFIG.scrollSummaryCooldown;
+            }
+            return result;
+        }
+
+        handleScrollEvent(source, event) {
+            const now = Date.now();
+            if (now < this.scrollProgrammaticUntil) return;
+            if (source !== window && this.isAdaptiveWebElement(source)) return;
+
+            const metrics = this.getScrollMetrics(source);
+            if (metrics.range < CONFIG.scrollMinRange) return;
+            let tracker = this.scrollTrackers.get(source);
+            if (!tracker) {
+                tracker = this.createScrollTracker(metrics, now);
+                this.scrollTrackers.set(source, tracker);
+            }
+
+            this.recordScrollContent(source, tracker, now);
+            const result = this.processScrollSample(tracker, metrics, now);
+
+            if (result.rapidSkim) this.onRapidSkimDetected(source, tracker, result.metadata);
+            if (result.triggerSummary) this.onScrollBackSummaryDetected(source, tracker, result.metadata);
+
+            if (source === window) {
+                const elapsed = Math.max(now - (tracker.previousEngagedAt || now), 1);
+                const previousPosition = tracker.previousEngagedPosition ?? metrics.position;
+                const speed = Math.abs(metrics.position - previousPosition) / elapsed * 1000;
+                tracker.previousEngagedAt = now;
+                tracker.previousEngagedPosition = metrics.position;
+                this.checkEngaged(now, speed, metrics.position);
+            }
+        }
+
+        onRapidSkimDetected(source, tracker) {
+            if (CONFIG.debug) console.log('Detected: Rapid Skim', { source: source === window ? 'window' : 'container' });
+            this.ui.showScrollToast('Rapid skimming detected. Return near the top for automatic key takeaways.');
+            this.api.log('rapid_skim_detected', {
+                source_type: source === window ? 'window' : 'container',
+                max_depth: Number(tracker.maxDepth.toFixed(2)),
+                fast_event_count: tracker.fastEventTotal
+            });
+        }
+
+        async onScrollBackSummaryDetected(source, tracker, metadata) {
+            if (this.shouldSuppressScrollSummary(source)) return;
+            this.scrollSummaryInFlight = true;
+            this.setScrollSummaryCount(this.getScrollSummaryCount() + 1);
+
+            const summaryText = this.buildScrollSummaryText(source, tracker);
+            const localSummary = this.buildLocalScrollSummary(summaryText);
+            const sourceLabel = source === window ? 'Page' : 'Scrollable section';
+            const requestId = this.ui.showScrollSummaryLoading({ sourceLabel, maxDepth: metadata.maxDepth });
+            this.applyRapidSkimMode(source);
+            this.api.log('scroll_back_summary', {
+                source_type: source === window ? 'window' : 'container',
+                max_depth: Number(metadata.maxDepth.toFixed(2)),
+                downward_travel_ratio: Number(metadata.downwardTravelRatio.toFixed(2)),
+                return_travel_ratio: Number(metadata.returnTravelRatio.toFixed(2)),
+                gesture_duration_ms: Math.round(metadata.gestureDuration),
+                average_speed: Math.round(metadata.averageSpeed),
+                fast_event_count: metadata.fastEventTotal
+            });
+
+            try {
+                const response = summaryText.length >= 120 ? await this.api.summarize(summaryText) : null;
+                const hasRemoteSummary = Boolean(response && response.summary);
+                const method = hasRemoteSummary && !String(response.method || '').startsWith('fallback')
+                    ? 'Gemini summary'
+                    : 'Local summary';
+                const summary = hasRemoteSummary && method === 'Gemini summary'
+                    ? response.summary
+                    : localSummary;
+                this.ui.showScrollSummary({
+                    requestId,
+                    summary,
+                    method,
+                    sourceLabel,
+                    maxDepth: metadata.maxDepth,
+                    onReadFromStart: () => this.scrollSourceToStart(source),
+                    onDismiss: () => this.api.log('scroll_back_summary_dismissed', {
+                        source_type: source === window ? 'window' : 'container'
+                    })
+                });
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb summary request used the local fallback', error);
+                this.ui.showScrollSummary({
+                    requestId,
+                    summary: localSummary,
+                    method: 'Local summary',
+                    sourceLabel,
+                    maxDepth: metadata.maxDepth,
+                    onReadFromStart: () => this.scrollSourceToStart(source),
+                    onDismiss: () => this.api.log('scroll_back_summary_dismissed', {
+                        source_type: source === window ? 'window' : 'container'
+                    })
+                });
+            } finally {
+                this.scrollSummaryInFlight = false;
+            }
+        }
+
+        shouldSuppressScrollSummary(source) {
+            if (this.scrollSummaryInFlight || document.hidden) return true;
+            if (this.getScrollSummaryCount() >= CONFIG.scrollSummarySessionLimit) return true;
+            if (document.querySelector('.aw-summary-box, .aw-modal-backdrop')) return true;
+            if (window.getSelection && window.getSelection().toString().trim()) return true;
+            if (source !== window && (!source || !source.isConnected)) return true;
+            const activeMedia = Array.from(document.querySelectorAll('video, audio'))
+                .some(media => !media.paused && !media.ended);
+            return activeMedia;
+        }
+
+        recordScrollContent(source, tracker, now = Date.now()) {
+            if (now - tracker.lastContentAt < CONFIG.scrollContentSampleInterval) return;
+            tracker.lastContentAt = now;
+            const root = source === window
+                ? document.querySelector('main, article') || document.body
+                : source;
+            if (!root || !root.querySelectorAll) return;
+
+            const sourceRect = source === window
+                ? { top: 0, bottom: window.innerHeight }
+                : source.getBoundingClientRect();
+            const elements = root.querySelectorAll('h1, h2, h3, h4, p, li');
+            for (const element of elements) {
+                if (this.isAdaptiveWebElement(element)) continue;
+                const rect = element.getBoundingClientRect();
+                if (rect.bottom < sourceRect.top || rect.top > sourceRect.bottom) continue;
+                const text = this.redactSensitiveText(element.innerText || element.textContent || '').slice(0, 700);
+                if (text.length < 20) continue;
+                const type = /^H[1-4]$/.test(element.tagName) ? element.tagName : 'TEXT';
+                const key = `${type}:${text.slice(0, 100)}`;
+                if (!tracker.contentSnippets.has(key)) tracker.contentSnippets.set(key, { type, text });
+                if (tracker.contentSnippets.size >= 40) break;
+            }
+        }
+
+        buildScrollSummaryText(source, tracker) {
+            const sourceLabel = source === window ? 'full page' : 'scrollable section';
+            const snippets = Array.from(tracker.contentSnippets.values());
+            let content = snippets.map(item => `[${item.type}] ${item.text}`).join('\n');
+            if (content.length < 240) {
+                const root = source === window
+                    ? document.querySelector('main, article') || document.body
+                    : source;
+                content = this.redactSensitiveText(root?.innerText || root?.textContent || '');
+            }
+            return [
+                `Page title: ${this.redactSensitiveText(document.title).slice(0, 160)}`,
+                `Content source: ${sourceLabel}`,
+                'Behavior: The user rapidly skimmed deep into this content and returned near the beginning.',
+                'Create three concise key takeaways from only the content below.',
+                '',
+                content.slice(0, CONFIG.scrollContentMaxChars)
+            ].join('\n');
+        }
+
+        buildLocalScrollSummary(summaryText) {
+            const lines = String(summaryText || '')
+                .split(/\n+/)
+                .map(line => line.replace(/^\[(?:H[1-4]|TEXT)\]\s*/, '').trim())
+                .filter(line => line.length >= 30 && !/^(Page title|Content source|Behavior|Create three)/i.test(line));
+            const takeaways = [];
+            for (const line of lines) {
+                const sentences = line.match(/[^.!?]+[.!?]?/g) || [line];
+                for (const rawSentence of sentences) {
+                    const sentence = rawSentence.trim();
+                    if (sentence.length < 30 || takeaways.some(item => item.toLowerCase() === sentence.toLowerCase())) continue;
+                    takeaways.push(sentence.slice(0, 180));
+                    if (takeaways.length >= 3) break;
+                }
+                if (takeaways.length >= 3) break;
+            }
+            if (takeaways.length === 0) {
+                return '- Review the main headings in this section.\n- Revisit any controls or details skipped during the rapid scroll.\n- Continue reading from the beginning when ready.';
+            }
+            return takeaways.map(item => `- ${item}`).join('\n');
+        }
+
+        applyRapidSkimMode(source) {
+            const root = source === window
+                ? document.querySelector('main, article') || document.body
+                : source;
+            if (!root || !root.querySelectorAll) return;
+            const paragraphs = Array.from(root.querySelectorAll('p'))
+                .filter(paragraph =>
+                    !this.isAdaptiveWebElement(paragraph) &&
+                    paragraph.dataset.awTldrPrepared !== 'true' &&
+                    (paragraph.innerText || '').trim().length >= 280
+                )
+                .slice(0, 8);
+            paragraphs.forEach(paragraph => {
+                paragraph.dataset.awTldrPrepared = 'true';
+                paragraph.classList.add('aw-tldr-collapsed');
+                const toggle = document.createElement('button');
+                toggle.type = 'button';
+                toggle.className = 'aw-tldr-read-more';
+                toggle.textContent = 'Read more';
+                toggle.addEventListener('click', () => {
+                    const collapsed = paragraph.classList.toggle('aw-tldr-collapsed');
+                    toggle.textContent = collapsed ? 'Read more' : 'Show less';
+                });
+                paragraph.insertAdjacentElement('afterend', toggle);
+            });
+        }
+
+        scrollSourceToStart(source) {
+            this.scrollProgrammaticUntil = Date.now() + 1800;
+            if (source === window) window.scrollTo({ top: 0, behavior: 'smooth' });
+            else source.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        getScrollSummaryCount() {
+            try {
+                return Number(sessionStorage.getItem('aw-scroll-summary-count') || 0);
+            } catch (error) {
+                return 0;
+            }
+        }
+
+        setScrollSummaryCount(count) {
+            try {
+                sessionStorage.setItem('aw-scroll-summary-count', String(count));
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb scroll summary count could not be saved', error);
             }
         }
 
         async onSkimmerDetected() {
-            if (this.skimmerTriggered) return;
-            this.skimmerTriggered = true;
+            // Kept as a compatibility entry point for older integrations.
+            const metrics = this.getScrollMetrics(window);
+            const tracker = this.scrollTrackers.get(window) || this.createScrollTracker(metrics);
+            this.onRapidSkimDetected(window, tracker);
 
-            if (CONFIG.debug) console.log('Detected: Skimmer');
-            this.ui.showToast('We see you are skimming! Loading key takeaways...');
-            this.api.log('skimmer_detected');
-
-            const text = document.body.innerText.substring(0, 1000);
-            const summary = await this.api.summarize(text);
-            if (summary) {
-                this.ui.showTakeaways(summary.summary);
-            }
+            return null;
         }
 
         checkEngaged(now, speed, scrollY) {
@@ -1096,12 +1515,15 @@
         isAdaptiveWebElement(target) {
             return Boolean(target && target.closest && target.closest([
                 '.aw-suggestion-bubble',
+                '.aw-summary-box',
+                '.aw-scroll-toast',
                 '.aw-takeaways',
                 '.aw-sidebar',
                 '.aw-shortcuts-sidebar',
                 '.aw-modal-backdrop',
                 '.aw-summarize-btn',
-                '.aw-simplify-btn'
+                '.aw-simplify-btn',
+                '.aw-tldr-read-more'
             ].join(',')));
         }
 
@@ -1511,7 +1933,7 @@
         }
 
         async summarize(text) {
-            return this.post('summarize', { text });
+            return this.post('summarize', { text }, 15000);
         }
 
         async suggest(text) {
@@ -1534,6 +1956,8 @@
 
     class UIAdapter {
         constructor() {
+            this.scrollSummaryRequestId = 0;
+            this.currentScrollSummaryBox = null;
             this.injectStyles();
         }
 
@@ -1794,6 +2218,179 @@
         showToast(msg) {
             // Optional simple toast
             console.log(msg);
+        }
+
+        showScrollToast(message) {
+            document.querySelector('.aw-scroll-toast')?.remove();
+            const toast = document.createElement('div');
+            toast.className = 'aw-scroll-toast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-live', 'polite');
+            toast.textContent = String(message || 'AdaptiveWeb detected rapid scrolling.');
+            document.body.appendChild(toast);
+            requestAnimationFrame(() => toast.classList.add('aw-visible'));
+            setTimeout(() => {
+                toast.classList.remove('aw-visible');
+                setTimeout(() => toast.remove(), 220);
+            }, 4200);
+        }
+
+        createScrollSummaryShell({ sourceLabel, maxDepth }) {
+            this.currentScrollSummaryBox?.remove();
+            if (this.scrollSummaryEscapeHandler) {
+                document.removeEventListener('keydown', this.scrollSummaryEscapeHandler, true);
+            }
+
+            const box = document.createElement('aside');
+            box.className = 'aw-summary-box';
+            box.setAttribute('role', 'dialog');
+            box.setAttribute('aria-modal', 'false');
+            box.setAttribute('aria-label', 'Automatic scroll-back summary');
+            box.setAttribute('aria-live', 'polite');
+
+            const header = document.createElement('div');
+            header.className = 'aw-summary-box-header';
+            const headingGroup = document.createElement('div');
+            const eyebrow = document.createElement('span');
+            eyebrow.className = 'aw-summary-eyebrow';
+            eyebrow.textContent = 'Scroll-back summary';
+            const heading = document.createElement('strong');
+            heading.className = 'aw-summary-heading';
+            heading.textContent = 'Key takeaways from your skim';
+            headingGroup.append(eyebrow, heading);
+
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'aw-close-btn';
+            close.setAttribute('aria-label', 'Dismiss summary');
+            close.textContent = '\u00d7';
+            header.append(headingGroup, close);
+
+            const meta = document.createElement('div');
+            meta.className = 'aw-summary-meta';
+            const source = document.createElement('span');
+            source.textContent = String(sourceLabel || 'Page');
+            const depth = document.createElement('span');
+            const percent = Math.max(0, Math.min(100, Math.round(Number(maxDepth || 0) * 100)));
+            depth.textContent = `${percent}% depth reached`;
+            meta.append(source, depth);
+
+            const content = document.createElement('div');
+            content.className = 'aw-scroll-summary-content';
+            const footer = document.createElement('div');
+            footer.className = 'aw-summary-footer';
+            const privacy = document.createElement('small');
+            privacy.className = 'aw-summary-privacy';
+            privacy.textContent = 'Only redacted text from the content you passed was used.';
+            footer.appendChild(privacy);
+
+            box.append(header, meta, content, footer);
+            document.body.appendChild(box);
+            this.currentScrollSummaryBox = box;
+            this.scrollSummaryOnDismiss = null;
+            this.scrollSummaryEscapeHandler = (event) => {
+                if (event.key === 'Escape') {
+                    this.closeScrollSummary('escape', this.scrollSummaryOnDismiss);
+                }
+            };
+            document.addEventListener('keydown', this.scrollSummaryEscapeHandler, true);
+            requestAnimationFrame(() => box.classList.add('aw-visible'));
+            return box;
+        }
+
+        closeScrollSummary(reason = 'dismissed', onDismiss = null) {
+            const box = this.currentScrollSummaryBox;
+            if (!box) return;
+            this.scrollSummaryRequestId += 1;
+            this.currentScrollSummaryBox = null;
+            if (this.scrollSummaryEscapeHandler) {
+                document.removeEventListener('keydown', this.scrollSummaryEscapeHandler, true);
+                this.scrollSummaryEscapeHandler = null;
+            }
+            this.scrollSummaryOnDismiss = null;
+            box.classList.remove('aw-visible');
+            setTimeout(() => box.remove(), 220);
+            if (typeof onDismiss === 'function') onDismiss(reason);
+        }
+
+        showScrollSummaryLoading({ sourceLabel, maxDepth }) {
+            const requestId = ++this.scrollSummaryRequestId;
+            const box = this.createScrollSummaryShell({ sourceLabel, maxDepth });
+            box.dataset.requestId = String(requestId);
+            const content = box.querySelector('.aw-scroll-summary-content');
+            const loading = document.createElement('div');
+            loading.className = 'aw-summary-loading';
+            loading.setAttribute('aria-busy', 'true');
+            const spinner = document.createElement('span');
+            spinner.className = 'aw-summary-spinner';
+            spinner.setAttribute('aria-hidden', 'true');
+            const text = document.createElement('span');
+            text.textContent = 'Preparing three concise takeaways...';
+            loading.append(spinner, text);
+            content.appendChild(loading);
+            box.querySelector('.aw-close-btn').addEventListener('click', () => this.closeScrollSummary('loading-dismissed'));
+            return requestId;
+        }
+
+        showScrollSummary({ requestId, summary, method, sourceLabel, onReadFromStart, onDismiss }) {
+            if (requestId !== this.scrollSummaryRequestId || !this.currentScrollSummaryBox) return false;
+            this.scrollSummaryOnDismiss = onDismiss;
+            const box = this.currentScrollSummaryBox;
+            const content = box.querySelector('.aw-scroll-summary-content');
+            const footer = box.querySelector('.aw-summary-footer');
+            content.replaceChildren();
+
+            const badge = document.createElement('span');
+            badge.className = method === 'Gemini summary'
+                ? 'aw-summary-method aw-summary-method--ai'
+                : 'aw-summary-method aw-summary-method--local';
+            badge.textContent = String(method || 'Local summary');
+            content.appendChild(badge);
+
+            const lines = String(summary || '')
+                .split(/\n+/)
+                .map(line => line.replace(/^\s*(?:[-*\u2022]|\d+[.)])\s*/, '').trim())
+                .filter(Boolean)
+                .slice(0, 4);
+            if (lines.length > 1) {
+                const list = document.createElement('ul');
+                list.className = 'aw-summary-list';
+                lines.forEach(line => {
+                    const item = document.createElement('li');
+                    item.textContent = line;
+                    list.appendChild(item);
+                });
+                content.appendChild(list);
+            } else {
+                const paragraph = document.createElement('p');
+                paragraph.className = 'aw-summary-text';
+                paragraph.textContent = lines[0] || 'Review the main headings before continuing.';
+                content.appendChild(paragraph);
+            }
+
+            const actions = document.createElement('div');
+            actions.className = 'aw-summary-actions';
+            const restart = document.createElement('button');
+            restart.type = 'button';
+            restart.className = 'aw-read-full-btn';
+            restart.textContent = sourceLabel === 'Scrollable section' ? 'Read section from start' : 'Read from start';
+            restart.addEventListener('click', () => {
+                if (typeof onReadFromStart === 'function') onReadFromStart();
+                this.closeScrollSummary('read-from-start');
+            });
+            const dismiss = document.createElement('button');
+            dismiss.type = 'button';
+            dismiss.className = 'aw-summary-dismiss-btn';
+            dismiss.textContent = 'Dismiss';
+            dismiss.addEventListener('click', () => this.closeScrollSummary('dismissed', onDismiss));
+            actions.append(restart, dismiss);
+            footer.prepend(actions);
+
+            const loadingClose = box.querySelector('.aw-close-btn');
+            const close = loadingClose.cloneNode(true);
+            loadingClose.replaceWith(close);
+            close.addEventListener('click', () => this.closeScrollSummary('dismissed', onDismiss));
+            return true;
         }
 
         showLegacySuggestion(coords, onAction) {
