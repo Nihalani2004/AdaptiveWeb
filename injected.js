@@ -3311,105 +3311,474 @@
         constructor(api) {
             this.api = api;
             this.shortcuts = [];
+            this.targetMap = new Map();
+            this.pageActions = [];
+            this.pendingChords = [];
+            this.sequenceTimer = null;
+            this.sequenceTimeout = 1200;
+            this.container = null;
+            this.statusElement = null;
+            this.isCollapsed = false;
+            this.startedListening = false;
             this.init();
         }
 
         async init() {
-            // Get content for context
-            const text = document.body.innerText.substring(0, 3000);
-            const res = await this.api.post('shortcuts', { text });
+            const context = this.buildShortcutContext();
 
-            if (res && res.shortcuts && res.shortcuts.length > 0) {
-                this.shortcuts = res.shortcuts;
+            // Render deterministic, working shortcuts immediately. Gemini may replace
+            // them only with shortcuts grounded to the same discovered controls.
+            this.shortcuts = this.prepareShortcuts(this.getLocalFallbackShortcuts(), 'Local shortcuts');
+            this.renderSidebar();
+            this.startListening();
+
+            const res = await this.api.post('shortcuts', { text: JSON.stringify(context) });
+            const grounded = this.prepareShortcuts(res?.shortcuts, res?.method || 'AI shortcuts');
+            if (grounded.length >= 3) {
+                this.shortcuts = grounded;
                 this.renderSidebar();
-                this.startListening();
             }
         }
 
+        buildShortcutContext() {
+            const availableActions = this.collectPageActions();
+            return {
+                schemaVersion: 2,
+                page: {
+                    domain: window.location.hostname,
+                    title: String(document.title || '').slice(0, 160)
+                },
+                availableActions,
+                builtInActions: [
+                    { actionType: 'scroll_top', label: 'Go to page start' },
+                    { actionType: 'scroll_bottom', label: 'Go to page end' },
+                    { actionType: 'toggle_shortcuts', label: 'Show or hide shortcuts' }
+                ]
+            };
+        }
+
+        collectPageActions() {
+            this.targetMap.clear();
+            const actions = [];
+            const seen = new Set();
+            const selector = [
+                'a[href]',
+                'button',
+                'input:not([type="hidden"])',
+                'select',
+                'textarea',
+                '[role="button"]',
+                '[role="link"]',
+                '[role="menuitem"]',
+                '[tabindex]:not([tabindex="-1"])'
+            ].join(',');
+            const candidates = Array.from(document.querySelectorAll(selector));
+
+            for (const target of candidates) {
+                if (actions.length >= 30 || !this.isUsableTarget(target)) continue;
+                const label = this.getTargetLabel(target);
+                if (!label) continue;
+                const type = this.getTargetType(target);
+                const identity = `${type}:${label.toLowerCase()}`;
+                if (seen.has(identity)) continue;
+                seen.add(identity);
+
+                const targetId = `shortcut-target-${actions.length + 1}`;
+                const capabilities = [];
+                if (this.isProgrammaticallyFocusable(target)) capabilities.push('focus');
+                if (this.isSafelyActivatable(target)) capabilities.push('activate');
+                if (capabilities.length === 0) continue;
+                this.targetMap.set(targetId, target);
+                actions.push({ targetId, label, type, capabilities });
+            }
+            this.pageActions = actions;
+            return actions;
+        }
+
+        isUsableTarget(target) {
+            if (!target || target.closest?.('[data-aw-shortcuts-root], .aw-suggestion-bubble, .aw-summary-box, .aw-tldr-toolbar')) return false;
+            if (target.disabled || target.getAttribute?.('aria-disabled') === 'true' || target.hidden) return false;
+            const style = window.getComputedStyle ? window.getComputedStyle(target) : null;
+            if (style && (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none')) return false;
+            const rect = target.getBoundingClientRect?.();
+            return !rect || (rect.width > 0 && rect.height > 0);
+        }
+
+        isProgrammaticallyFocusable(target) {
+            const tag = String(target?.tagName || '').toUpperCase();
+            if (['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(tag)) return true;
+            return Number(target?.tabIndex) >= 0;
+        }
+
+        getTargetLabel(target) {
+            const labelledBy = target.getAttribute?.('aria-labelledby');
+            const labelledText = labelledBy
+                ? labelledBy.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' ')
+                : '';
+            const label = target.getAttribute?.('aria-label') ||
+                labelledText ||
+                target.labels?.[0]?.innerText ||
+                target.innerText ||
+                target.value ||
+                target.getAttribute?.('title') ||
+                target.getAttribute?.('placeholder') ||
+                '';
+            return String(label).replace(/\s+/g, ' ').trim().slice(0, 100);
+        }
+
+        getTargetType(target) {
+            const role = target.getAttribute?.('role');
+            if (role) return role;
+            const tag = String(target.tagName || 'control').toLowerCase();
+            if (tag === 'input') return String(target.type || 'input').toLowerCase();
+            return tag;
+        }
+
+        getLocalFallbackShortcuts() {
+            const shortcuts = [
+                { key: 'Alt+Shift+Home', action: 'Go to page start', actionType: 'scroll_top', targetId: null },
+                { key: 'Alt+Shift+End', action: 'Go to page end', actionType: 'scroll_bottom', targetId: null },
+                { key: 'Alt+Shift+?', action: 'Show or hide shortcuts', actionType: 'toggle_shortcuts', targetId: null }
+            ];
+            this.pageActions.slice(0, 2).forEach((target, index) => {
+                shortcuts.push({
+                    key: `Alt+Shift+${index + 1}`,
+                    action: `Go to ${target.label}`,
+                    actionType: target.capabilities.includes('focus') ? 'focus' : 'activate',
+                    targetId: target.targetId,
+                    targetLabel: target.label
+                });
+            });
+            return shortcuts;
+        }
+
+        prepareShortcuts(rawShortcuts, source = 'Local shortcuts') {
+            if (!Array.isArray(rawShortcuts)) return [];
+            const supportedActions = new Set(['focus', 'activate', 'scroll_top', 'scroll_bottom', 'toggle_shortcuts']);
+            const used = new Set();
+            const prepared = [];
+
+            for (const raw of rawShortcuts) {
+                if (!raw || typeof raw !== 'object') continue;
+                const binding = this.parseShortcutKey(raw.key);
+                const actionType = String(raw.actionType || '').toLowerCase();
+                if (!binding || !supportedActions.has(actionType) || used.has(binding.signature)) continue;
+
+                const targetId = raw.targetId ? String(raw.targetId) : null;
+                let resolvedType = actionType;
+                if (resolvedType === 'focus' || resolvedType === 'activate') {
+                    const target = this.targetMap.get(targetId);
+                    if (!target || !target.isConnected) continue;
+                    if (resolvedType === 'activate' && !this.isSafelyActivatable(target)) resolvedType = 'focus';
+                }
+
+                used.add(binding.signature);
+                prepared.push({
+                    key: binding.display,
+                    chords: binding.chords,
+                    signature: binding.signature,
+                    action: String(raw.action || 'Shortcut action').replace(/\s+/g, ' ').trim().slice(0, 100),
+                    actionType: resolvedType,
+                    targetId,
+                    targetLabel: String(raw.targetLabel || '').slice(0, 100),
+                    source
+                });
+                if (prepared.length >= 5) break;
+            }
+            return prepared;
+        }
+
+        parseShortcutKey(value) {
+            const text = String(value || '').replace(/\s+/g, ' ').trim();
+            if (!text || text.length > 80) return null;
+            const parts = text.split(/\s+(?:then|→)\s+|\s*,\s*/i).filter(Boolean);
+            if (parts.length === 0 || parts.length > 4) return null;
+            const chords = parts.map(part => this.parseChord(part));
+            if (chords.some(chord => !chord)) return null;
+            const signature = chords.join(' then ');
+            return { display: this.formatShortcut(chords), chords, signature };
+        }
+
+        parseChord(value) {
+            const tokens = String(value || '').split(/\s*\+\s*/).filter(Boolean);
+            if (tokens.length === 0 || tokens.length > 5) return null;
+            const modifiers = new Set();
+            let baseKey = null;
+            for (const token of tokens) {
+                const normalized = this.normalizeBaseKey(token);
+                const modifier = { control: 'ctrl', ctrl: 'ctrl', option: 'alt', alt: 'alt', command: 'meta', cmd: 'meta', meta: 'meta', shift: 'shift' }[normalized];
+                if (modifier) {
+                    modifiers.add(modifier);
+                } else if (!baseKey) {
+                    baseKey = normalized;
+                } else {
+                    return null;
+                }
+            }
+            if (!baseKey || ['ctrl', 'alt', 'shift', 'meta'].includes(baseKey) || !this.isSupportedBaseKey(baseKey)) return null;
+            const ordered = ['ctrl', 'alt', 'shift', 'meta'].filter(modifier => modifiers.has(modifier));
+            return [...ordered, baseKey].join('+');
+        }
+
+        normalizeBaseKey(value) {
+            const key = String(value || '').trim().toLowerCase();
+            const aliases = {
+                'return': 'enter', 'esc': 'escape', 'spacebar': 'space', ' ': 'space',
+                'left': 'arrowleft', 'right': 'arrowright', 'up': 'arrowup', 'down': 'arrowdown',
+                'pgup': 'pageup', 'pgdn': 'pagedown', 'del': 'delete'
+            };
+            return aliases[key] || key;
+        }
+
+        isSupportedBaseKey(key) {
+            return String(key).length === 1 ||
+                /^(?:f(?:[1-9]|1\d|2[0-4])|enter|escape|space|tab|home|end|pageup|pagedown|arrowleft|arrowright|arrowup|arrowdown|delete|backspace|insert)$/i.test(String(key));
+        }
+
+        formatShortcut(chords) {
+            const names = {
+                ctrl: 'Ctrl', alt: 'Alt', shift: 'Shift', meta: 'Meta', enter: 'Enter', escape: 'Escape',
+                space: 'Space', home: 'Home', end: 'End', pageup: 'PageUp', pagedown: 'PageDown',
+                arrowleft: 'ArrowLeft', arrowright: 'ArrowRight', arrowup: 'ArrowUp', arrowdown: 'ArrowDown',
+                delete: 'Delete', backspace: 'Backspace', tab: 'Tab'
+            };
+            return chords.map(chord => chord.split('+').map(token => names[token] || token.toUpperCase()).join('+')).join(' then ');
+        }
+
+        chordFromEvent(event) {
+            if (!event || ['Control', 'Alt', 'Shift', 'Meta'].includes(event.key)) return null;
+            const baseKey = this.normalizeBaseKey(event.key);
+            if (!baseKey) return null;
+            const modifiers = [];
+            if (event.ctrlKey) modifiers.push('ctrl');
+            if (event.altKey) modifiers.push('alt');
+            if (event.shiftKey) modifiers.push('shift');
+            if (event.metaKey) modifiers.push('meta');
+            return [...modifiers, baseKey].join('+');
+        }
+
         renderSidebar() {
+            const previousCollapsed = this.isCollapsed;
+            this.container?.remove();
             const container = document.createElement('div');
             container.className = 'aw-shortcuts-sidebar';
-            container.innerHTML = `
-                <div style="margin-bottom:10px; font-weight:bold; color:#888; font-size:11px; text-transform:uppercase; letter-spacing:1px;">Shortcuts</div>
-                ${this.shortcuts.map(s => `
-                    <div class="aw-shortcut-item" data-key="${s.key.toLowerCase()}">
-                        <kbd>${s.key}</kbd>
-                        <span>${s.action}</span>
-                    </div>
-                `).join('')}
-            `;
+            container.dataset.awShortcutsRoot = 'true';
+            container.setAttribute('role', 'region');
+            container.setAttribute('aria-label', 'AdaptiveWeb keyboard shortcuts');
 
-            // Styles
-            const style = document.createElement('style');
-            style.textContent = `
-                .aw-shortcuts-sidebar {
-                    position: fixed;
-                    left: 20px;
-                    top: 50%;
-                    transform: translateY(-50%);
-                    background: rgba(30, 30, 30, 0.95); /* DARK MODE */
-                    border: 1px solid #444;
-                    border-radius: 12px;
-                    padding: 15px;
-                    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-                    z-index: 9999;
-                    font-family: 'Segoe UI', sans-serif;
-                    width: 220px;
-                    transition: opacity 0.3s;
-                    opacity: 0.8; /* Slightly more visible by default */
-                    color: #fff;
-                    backdrop-filter: blur(10px);
-                }
-                .aw-shortcuts-sidebar:hover { opacity: 1; }
-                .aw-shortcut-item {
-                    display: flex;
-                    align-items: center;
-                    margin-bottom: 10px;
-                    font-size: 13px;
-                    color: #ddd;
-                    padding: 6px;
-                    border-radius: 6px;
-                    transition: all 0.2s;
-                    border: 1px solid transparent;
-                }
-                .aw-shortcut-item.active {
-                    background: rgba(59, 130, 246, 0.2);
-                    border-color: rgba(59, 130, 246, 0.5);
-                    color: white;
-                    transform: scale(1.02);
-                }
-                .aw-shortcut-item kbd {
-                    background: #333;
-                    border: 1px solid #555;
-                    border-radius: 4px;
-                    color: #fff;
-                    padding: 3px 8px;
-                    font-family: monospace;
-                    font-size: 12px;
-                    margin-right: 12px;
-                    min-width: 25px;
-                    text-align: center;
-                    box-shadow: 0 2px 0 #111;
-                    font-weight: bold;
-                }
-            `;
-            document.head.appendChild(style);
+            const header = document.createElement('div');
+            header.className = 'aw-shortcuts-header';
+            const title = document.createElement('strong');
+            title.textContent = 'Adaptive shortcuts';
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'aw-shortcuts-toggle';
+            toggle.setAttribute('aria-label', 'Collapse shortcut help');
+            toggle.textContent = '−';
+            toggle.addEventListener('click', () => this.toggleSidebar());
+            header.append(title, toggle);
+
+            const list = document.createElement('div');
+            list.className = 'aw-shortcuts-list';
+            this.shortcuts.forEach((shortcut, index) => {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.className = 'aw-shortcut-item';
+                item.dataset.shortcutIndex = String(index);
+                item.setAttribute('aria-label', `${shortcut.key}: ${shortcut.action}`);
+                const key = document.createElement('kbd');
+                key.textContent = shortcut.key;
+                const action = document.createElement('span');
+                action.textContent = shortcut.action;
+                item.append(key, action);
+                item.addEventListener('click', () => this.executeShortcut(shortcut));
+                list.appendChild(item);
+            });
+
+            const status = document.createElement('div');
+            status.className = 'aw-shortcuts-status';
+            status.setAttribute('role', 'status');
+            status.setAttribute('aria-live', 'polite');
+            status.textContent = 'Ready';
+            container.append(header, list, status);
             document.body.appendChild(container);
+            this.container = container;
+            this.statusElement = status;
+            this.isCollapsed = previousCollapsed;
+            this.toggleSidebar(previousCollapsed);
         }
 
         startListening() {
-            document.addEventListener('keydown', (e) => {
-                // Ignore input fields
-                if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+            if (this.startedListening) return;
+            this.startedListening = true;
+            this.boundKeydown = event => this.handleKeydown(event);
+            window.addEventListener('keydown', this.boundKeydown, true);
+            window.addEventListener('pagehide', () => this.destroy(), { once: true });
+        }
 
-                const pressed = e.key.toLowerCase();
-                const item = document.querySelector(`.aw-shortcut-item[data-key="${pressed}"]`);
+        handleKeydown(event) {
+            if (event.repeat || event.isComposing || this.container?.contains(event.target)) return false;
+            const editable = this.isEditableTarget(event.target);
+            if (editable && !event.ctrlKey && !event.altKey && !event.metaKey) {
+                this.resetPendingSequence();
+                return false;
+            }
+            const chord = this.chordFromEvent(event);
+            if (!chord) return false;
+            return this.consumeChord(chord, event);
+        }
 
-                if (item) {
-                    item.classList.add('active');
-                    setTimeout(() => item.classList.remove('active'), 300);
+        isEditableTarget(target) {
+            if (!target) return false;
+            const tag = String(target.tagName || '').toUpperCase();
+            return ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) || Boolean(target.isContentEditable);
+        }
+
+        consumeChord(chord, event) {
+            let next = [...this.pendingChords, chord];
+            let matches = this.shortcuts.filter(shortcut => this.isSequencePrefix(next, shortcut.chords));
+            if (matches.length === 0 && this.pendingChords.length > 0) {
+                this.resetPendingSequence();
+                next = [chord];
+                matches = this.shortcuts.filter(shortcut => this.isSequencePrefix(next, shortcut.chords));
+            }
+            if (matches.length === 0) return false;
+
+            event.preventDefault?.();
+            event.stopPropagation?.();
+            event.stopImmediatePropagation?.();
+            const exact = matches.find(shortcut => shortcut.chords.length === next.length);
+            const hasLonger = matches.some(shortcut => shortcut.chords.length > next.length);
+
+            if (exact && !hasLonger) {
+                this.resetPendingSequence();
+                this.executeShortcut(exact);
+                return true;
+            }
+
+            this.pendingChords = next;
+            this.setStatus(`Waiting: ${this.formatShortcut(next)} …`);
+            if (this.sequenceTimer) clearTimeout(this.sequenceTimer);
+            this.sequenceTimer = setTimeout(() => {
+                if (exact) this.executeShortcut(exact);
+                else this.setStatus('Sequence timed out');
+                this.resetPendingSequence(false);
+            }, this.sequenceTimeout);
+            return true;
+        }
+
+        isSequencePrefix(prefix, sequence) {
+            return prefix.length <= sequence.length && prefix.every((chord, index) => chord === sequence[index]);
+        }
+
+        resetPendingSequence(clearStatus = true) {
+            this.pendingChords = [];
+            if (this.sequenceTimer) clearTimeout(this.sequenceTimer);
+            this.sequenceTimer = null;
+            if (clearStatus) this.setStatus('Ready');
+        }
+
+        executeShortcut(shortcut) {
+            if (!shortcut) return false;
+            this.resetPendingSequence(false);
+            let succeeded = false;
+
+            if (shortcut.actionType === 'scroll_top') {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+                succeeded = true;
+            } else if (shortcut.actionType === 'scroll_bottom') {
+                const bottom = Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
+                window.scrollTo({ top: bottom, behavior: 'smooth' });
+                succeeded = true;
+            } else if (shortcut.actionType === 'toggle_shortcuts') {
+                this.toggleSidebar(!this.isCollapsed);
+                succeeded = true;
+            } else {
+                const target = this.resolveTarget(shortcut);
+                if (!target) {
+                    this.setStatus(`Unavailable: ${shortcut.action}`);
+                    return false;
                 }
-            });
+                target.scrollIntoView?.({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+                target.focus?.({ preventScroll: true });
+                this.highlightTarget(target);
+                if (shortcut.actionType === 'activate') {
+                    if (!this.isSafelyActivatable(target)) {
+                        this.setStatus(`Focused safely: ${shortcut.action}`);
+                        this.highlightShortcut(shortcut);
+                        return true;
+                    }
+                    target.click?.();
+                }
+                succeeded = true;
+            }
+
+            if (succeeded) {
+                this.highlightShortcut(shortcut);
+                this.setStatus(`Done: ${shortcut.action}`);
+                this.api?.log?.('shortcut_executed', {
+                    key: shortcut.signature,
+                    action_type: shortcut.actionType,
+                    source: shortcut.source
+                });
+            }
+            return succeeded;
+        }
+
+        resolveTarget(shortcut) {
+            const stored = this.targetMap.get(shortcut.targetId);
+            const wanted = String(shortcut.targetLabel || '').toLowerCase();
+            if (stored?.isConnected && (!wanted || this.getTargetLabel(stored).toLowerCase() === wanted)) return stored;
+            if (!wanted) return null;
+            const current = this.collectPageActions().find(item => item.label.toLowerCase() === wanted);
+            return current ? this.targetMap.get(current.targetId) : null;
+        }
+
+        isSafelyActivatable(target) {
+            if (!target || target.disabled || target.getAttribute?.('aria-disabled') === 'true') return false;
+            const tag = String(target.tagName || '').toUpperCase();
+            const type = String(target.type || target.getAttribute?.('type') || '').toLowerCase();
+            if ((tag === 'BUTTON' && (!type || type === 'submit') && target.closest?.('form')) ||
+                (tag === 'INPUT' && ['submit', 'image', 'file'].includes(type))) return false;
+            const href = String(target.getAttribute?.('href') || '');
+            if (/^javascript:/i.test(href) || target.hasAttribute?.('download')) return false;
+            const label = this.getTargetLabel(target);
+            return !/\b(delete|remove|purchase|pay|checkout|buy|submit|send|publish|transfer|confirm|order|sign out|log out|unsubscribe|account|password)\b/i.test(label);
+        }
+
+        highlightTarget(target) {
+            target.classList?.add('aw-shortcut-target-highlight');
+            setTimeout(() => target.classList?.remove('aw-shortcut-target-highlight'), 1200);
+        }
+
+        highlightShortcut(shortcut) {
+            const index = this.shortcuts.indexOf(shortcut);
+            if (index < 0) return;
+            const item = this.container?.querySelector(`[data-shortcut-index="${index}"]`);
+            item?.classList.add('active');
+            setTimeout(() => item?.classList.remove('active'), 450);
+        }
+
+        toggleSidebar(forceCollapsed) {
+            this.isCollapsed = typeof forceCollapsed === 'boolean' ? forceCollapsed : !this.isCollapsed;
+            this.container?.classList.toggle('is-collapsed', this.isCollapsed);
+            const toggle = this.container?.querySelector('.aw-shortcuts-toggle');
+            if (toggle) {
+                toggle.textContent = this.isCollapsed ? '+' : '−';
+                toggle.setAttribute('aria-label', this.isCollapsed ? 'Expand shortcut help' : 'Collapse shortcut help');
+                toggle.setAttribute('aria-expanded', String(!this.isCollapsed));
+            }
+        }
+
+        setStatus(message) {
+            if (this.statusElement) this.statusElement.textContent = String(message || 'Ready');
+        }
+
+        destroy() {
+            if (this.boundKeydown) window.removeEventListener('keydown', this.boundKeydown, true);
+            this.resetPendingSequence(false);
+            this.container?.remove();
+            this.container = null;
         }
     }
 
