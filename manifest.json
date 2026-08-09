@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AdaptiveWeb",
-  "version": "1.3.0",
-  "description": "Adaptive browsing assistance with cursor guidance, independent compact reading, and reliable scroll-back summaries.",
+  "version": "1.4.0",
+  "description": "Adaptive browsing assistance with grounded keyboard shortcuts, cursor guidance, compact reading, and scroll-back summaries.",
   "permissions": [
     "activeTab",
     "scripting"
