@@ -489,6 +489,140 @@
   }
 }
 
+/* Grounded keyboard shortcuts */
+.aw-shortcuts-sidebar {
+  position: fixed;
+  left: 20px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2147483644;
+  width: min(300px, calc(100vw - 40px));
+  padding: 12px;
+  color: #f8fafc;
+  background: rgba(15, 23, 42, 0.97);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 14px;
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.35);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.aw-shortcuts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.aw-shortcuts-header strong {
+  color: #f8fafc;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.aw-shortcuts-toggle {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: #e2e8f0;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  cursor: pointer;
+  font: 700 18px/1 system-ui, sans-serif;
+}
+
+.aw-shortcuts-list {
+  display: grid;
+  gap: 7px;
+}
+
+.aw-shortcut-item {
+  display: grid;
+  grid-template-columns: minmax(84px, auto) 1fr;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin: 0;
+  padding: 7px;
+  color: #e2e8f0;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.aw-shortcut-item:hover,
+.aw-shortcut-item:focus-visible,
+.aw-shortcut-item.active {
+  color: #fff;
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(96, 165, 250, 0.65);
+  outline: none;
+}
+
+.aw-shortcut-item kbd {
+  display: inline-block;
+  padding: 4px 6px;
+  color: #fff;
+  text-align: center;
+  background: #1e293b;
+  border: 1px solid #64748b;
+  border-radius: 5px;
+  box-shadow: 0 2px 0 #020617;
+  font: 700 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.aw-shortcuts-status {
+  min-height: 17px;
+  margin-top: 9px;
+  color: #93c5fd;
+  font-size: 11px;
+}
+
+.aw-shortcuts-sidebar.is-collapsed {
+  width: auto;
+}
+
+.aw-shortcuts-sidebar.is-collapsed .aw-shortcuts-header {
+  margin: 0;
+}
+
+.aw-shortcuts-sidebar.is-collapsed .aw-shortcuts-header strong,
+.aw-shortcuts-sidebar.is-collapsed .aw-shortcuts-list,
+.aw-shortcuts-sidebar.is-collapsed .aw-shortcuts-status {
+  display: none;
+}
+
+.aw-shortcut-target-highlight {
+  outline: 4px solid #3b82f6 !important;
+  outline-offset: 4px !important;
+  box-shadow: 0 0 0 8px rgba(59, 130, 246, 0.22) !important;
+}
+
+@media (max-width: 640px) {
+  .aw-shortcuts-sidebar {
+    left: 10px;
+    top: auto;
+    bottom: 10px;
+    transform: none;
+    width: min(300px, calc(100vw - 20px));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aw-shortcut-item,
+  .aw-shortcut-target-highlight {
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Feature 4: Cursor Hesitation Suggestion */
 .aw-suggestion-bubble {
   position: fixed;
