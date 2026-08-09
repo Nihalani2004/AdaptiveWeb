@@ -86,6 +86,18 @@ Detects several forms of uncertainty and offers contextual, privacy-conscious gu
 
 ---
 
+### ⌨️ Grounded Keyboard Shortcuts
+
+Provides working keyboard access to controls that are actually present on the current page.
+
+* Availability: Three local navigation shortcuts appear immediately, even when the backend is offline
+* Grounding: Gemini can only bind keys to controls discovered by the extension; invented targets and unsupported actions are rejected
+* Keys: Supports single keys, modifier chords such as `Ctrl+Enter`, and ordered sequences such as `G then H`
+* Actions: Focuses or safely activates real controls, scrolls to the page start/end, and toggles the shortcut panel
+* Safety: Typing is protected, stale targets are re-resolved, and submit, payment, purchase, deletion, publishing, account and other sensitive controls are never activated automatically
+
+---
+
 ## 🧠 High-Level Architecture
 
 ```

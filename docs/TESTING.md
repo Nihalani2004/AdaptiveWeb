@@ -48,6 +48,18 @@
 9. **Feedback**: Select `Yes` or `Not really`. The buttons should disable after one response and aggregate feedback should be stored under `aw-cursor-help-feedback-v1`.
 10. **Privacy text**: The hesitation bubble must state that pointer patterns stay on-device and redacted page context is sent only after choosing AI help.
 
+### Feature 5: Grounded Keyboard Shortcuts
+
+1. **Offline availability**: Stop the backend and reload the extension. The shortcut panel must still show local bindings for page start, page end, and panel visibility.
+2. **Modifier chords**: Press the displayed `Alt+Shift` bindings and verify the corresponding action runs. A binding such as `Ctrl+Enter` must be recognized as one chord rather than as the `Enter` key alone.
+3. **Ordered sequences**: When a displayed sequence uses `G then H`, press `G`, then `H` within 1.2 seconds. The first key should show a waiting status and the action should execute only after the second key.
+4. **Typing protection**: Plain keys and sequences must not activate while typing in an input, textarea, select, or editable region. Explicit Ctrl/Alt/Meta chords may still run when displayed.
+5. **Grounded controls**: Control-specific shortcuts must focus or activate a currently connected control that appears in the page-action context. Missing or invented target IDs must not appear in the panel.
+6. **Safe activation**: Submit, payment, purchase, delete, send, publish, account, password and other sensitive controls may be focused but must never be clicked by a generated shortcut.
+7. **Stale targets**: On a dynamic page, replace a previously discovered control and use its shortcut. The extension should re-resolve the control by its grounded label or show an unavailable status without clicking another element.
+8. **Mouse alternative**: Selecting a row in the shortcut panel should run the same safe action as its keyboard binding.
+9. **Feedback**: Verify the panel announces `Waiting`, `Done`, `Focused safely`, `Unavailable`, or timeout status through its live status region.
+
 ## Troubleshooting
 - **Extension not working?**: Check `chrome://extensions` for errors. Ensure "Reload" is clicked after code changes.
 - **No Styles?**: Ensure `injected.css` is loaded (Network tab).
