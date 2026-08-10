@@ -88,7 +88,7 @@
 
             document.body.addEventListener('mouseover', (e) => {
                 const target = e.target.closest('p, article, h1, h2, h3, li');
-                if (!target || this.isAdaptiveWebElement(target) || target === currentTarget) return;
+                if (!target || target.dataset?.awReadingActive === 'true' || this.isAdaptiveWebElement(target) || target === currentTarget) return;
 
                 // Clear previous
                 if (hoverTimer) clearTimeout(hoverTimer);
