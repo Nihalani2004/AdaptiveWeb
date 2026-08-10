@@ -12,6 +12,7 @@ class SummarizeRequest(BaseModel):
 
 class SimplifyRequest(BaseModel):
     text: str
+    mode: str = "simplify"
 
 class RelatedRequest(BaseModel):
     url: str
