@@ -2705,34 +2705,16 @@
             this.currentScrollSummaryBox = null;
             this.currentTldrPrompt = null;
             this.currentTldrToolbar = null;
+            this.currentReadingPrompt = null;
+            this.readingAssistanceEntries = new Map();
+            this.readingAssistanceRequestId = 0;
+            this.readingParagraphIdCounter = 0;
             this.injectStyles();
         }
 
         injectStyles() {
             const style = document.createElement('style');
             style.textContent = `
-                /* Highlight */
-                .aw-highlight {
-                    background: rgba(255, 235, 59, 0.2);
-                    box-shadow: 0 0 0 2px rgba(255, 235, 59, 0.4);
-                    border-radius: 4px;
-                    transition: all 0.3s;
-                    position: relative;
-                }
-                .aw-simplify-btn {
-                    position: absolute;
-                    top: -25px;
-                    right: 0;
-                    background: #222;
-                    color: #fff;
-                    font-size: 12px;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    z-index: 1000;
-                    font-family: sans-serif;
-                }
-                
                 /* Sidebar */
                 .aw-sidebar {
                     position: fixed;
@@ -2906,30 +2888,268 @@
             }
         }
 
-        // 1. Difficulty
-        highlightAndPrompt(p, onSimplify) {
-            p.classList.add('aw-highlight');
-            const btn = document.createElement('div');
-            btn.className = 'aw-simplify-btn';
-            btn.innerHTML = '✨ Simplify';
-            btn.onclick = (e) => {
-                e.stopPropagation();
-                btn.innerHTML = 'Thinking...';
-                onSimplify();
-            };
-            // Insert relative to P
-            p.style.position = 'relative';
-            p.appendChild(btn);
+        // 1. Reading-difficulty assistance
+        createReadingButton(label, className = 'aw-reading-action') {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = className;
+            button.textContent = label;
+            return button;
         }
 
-        updateParagraph(p, text) {
-            p.innerHTML = text; // Replace content
-            p.classList.remove('aw-highlight');
-            const btn = p.querySelector('.aw-simplify-btn');
-            if (btn) btn.remove();
+        ensureReadingParagraphId(paragraph) {
+            if (paragraph.id) return { id: paragraph.id, generated: false };
+            this.readingParagraphIdCounter += 1;
+            paragraph.id = `aw-reading-paragraph-${this.readingParagraphIdCounter}`;
+            return { id: paragraph.id, generated: true };
+        }
 
-            p.style.borderLeft = "4px solid #4caf50";
-            p.style.paddingLeft = "10px";
+        showReadingDifficultyPrompt(paragraph, { onAction, onDismiss } = {}) {
+            if (!paragraph?.isConnected || !paragraph.parentNode) return false;
+            this.dismissReadingDifficultyPrompt('replaced');
+            const paragraphId = this.ensureReadingParagraphId(paragraph);
+            const prompt = document.createElement('aside');
+            prompt.className = 'aw-reading-difficulty-prompt aw-visible';
+            prompt.setAttribute('role', 'dialog');
+            prompt.setAttribute('aria-modal', 'false');
+            prompt.setAttribute('aria-label', 'Reading assistance');
+            prompt.setAttribute('aria-describedby', `${paragraphId.id}-reading-message`);
+
+            const heading = document.createElement('strong');
+            heading.className = 'aw-reading-heading';
+            heading.textContent = 'Would reading help be useful here?';
+            const message = document.createElement('p');
+            message.id = `${paragraphId.id}-reading-message`;
+            message.className = 'aw-reading-message';
+            message.textContent = 'This paragraph may be taking extra attention. Choose an optional aid; the original text will stay unchanged.';
+            const actions = document.createElement('div');
+            actions.className = 'aw-reading-actions';
+            let completed = false;
+            let dismissTimer = null;
+            let escapeHandler = null;
+            const removePrompt = () => {
+                if (dismissTimer) clearTimeout(dismissTimer);
+                document.removeEventListener('keydown', escapeHandler, true);
+                prompt.remove();
+                if (this.currentReadingPrompt?.element === prompt) this.currentReadingPrompt = null;
+                if (paragraphId.generated && !this.readingAssistanceEntries.has(paragraph)) paragraph.removeAttribute('id');
+            };
+            const dismiss = (reason = 'dismissed') => {
+                if (completed) return;
+                completed = true;
+                removePrompt();
+                onDismiss?.(reason);
+            };
+
+            [['Simplify', 'simplify'], ['Explain terms', 'terms'], ['Show example', 'example']].forEach(([label, mode]) => {
+                const button = this.createReadingButton(label);
+                button.setAttribute('aria-controls', paragraphId.id);
+                button.addEventListener('click', event => {
+                    event.stopPropagation();
+                    if (completed) return;
+                    completed = true;
+                    removePrompt();
+                    onAction?.(mode);
+                });
+                actions.appendChild(button);
+            });
+            const notNow = this.createReadingButton('Not now', 'aw-reading-action aw-reading-action-secondary');
+            notNow.addEventListener('click', event => {
+                event.stopPropagation();
+                dismiss('not-now');
+            });
+            actions.appendChild(notNow);
+            const privacy = document.createElement('small');
+            privacy.className = 'aw-reading-privacy';
+            privacy.textContent = 'Only this paragraph is processed after you choose an aid. Sensitive patterns are redacted first.';
+            prompt.append(heading, message, actions, privacy);
+            paragraph.insertAdjacentElement('afterend', prompt);
+
+            escapeHandler = event => {
+                if (event.key === 'Escape' && this.currentReadingPrompt?.element === prompt) dismiss('escape');
+            };
+            document.addEventListener('keydown', escapeHandler, true);
+            dismissTimer = setTimeout(() => dismiss('timeout'), 20000);
+            this.currentReadingPrompt = { element: prompt, paragraph, dismiss };
+            return true;
+        }
+
+        dismissReadingDifficultyPrompt(reason = 'dismissed') {
+            if (!this.currentReadingPrompt) return false;
+            this.currentReadingPrompt.dismiss(reason);
+            return true;
+        }
+
+        dismissReadingDifficultyPromptFor(paragraph, reason = 'content-removed') {
+            if (this.currentReadingPrompt?.paragraph !== paragraph) return false;
+            return this.dismissReadingDifficultyPrompt(reason);
+        }
+
+        showReadingAssistanceLoading(paragraph, { mode = 'simplify', onClose } = {}) {
+            if (!paragraph?.isConnected || !paragraph.parentNode) return null;
+            this.removeReadingAssistance(paragraph, 'replaced', false);
+            const paragraphId = this.ensureReadingParagraphId(paragraph);
+            this.readingAssistanceRequestId += 1;
+            const requestId = this.readingAssistanceRequestId;
+            const panel = document.createElement('section');
+            panel.className = 'aw-reading-assistance-panel';
+            panel.setAttribute('role', 'region');
+            panel.setAttribute('aria-live', 'polite');
+            panel.setAttribute('aria-busy', 'true');
+            panel.setAttribute('aria-label', 'Reading assistance result');
+            panel.setAttribute('data-aw-request-id', String(requestId));
+
+            const header = document.createElement('div');
+            header.className = 'aw-reading-panel-header';
+            const title = document.createElement('strong');
+            title.className = 'aw-reading-heading';
+            title.textContent = mode === 'terms' ? 'Explaining key terms' : mode === 'example' ? 'Preparing an example' : 'Preparing a simpler explanation';
+            const close = this.createReadingButton('Close', 'aw-reading-icon-button');
+            close.setAttribute('aria-label', 'Close reading assistance and restore the original paragraph');
+            header.append(title, close);
+            const body = document.createElement('div');
+            body.className = 'aw-reading-panel-body aw-reading-loading';
+            const spinner = document.createElement('span');
+            spinner.className = 'aw-reading-spinner';
+            spinner.setAttribute('aria-hidden', 'true');
+            const status = document.createElement('span');
+            status.textContent = 'Creating reading assistance…';
+            body.append(spinner, status);
+            panel.append(header, body);
+            paragraph.insertAdjacentElement('afterend', panel);
+
+            const entry = {
+                paragraph, panel, body, requestId, mode, onClose,
+                generatedId: paragraphId.generated,
+                originalAriaHidden: paragraph.getAttribute('aria-hidden'),
+                originallyHidden: paragraph.classList.contains('aw-reading-original-hidden'),
+                escapeHandler: null,
+                closed: false
+            };
+            entry.escapeHandler = event => {
+                if (event.key === 'Escape' && this.readingAssistanceEntries.get(paragraph) === entry) {
+                    this.removeReadingAssistance(paragraph, 'escape');
+                }
+            };
+            close.addEventListener('click', () => this.removeReadingAssistance(paragraph, 'close'));
+            document.addEventListener('keydown', entry.escapeHandler, true);
+            this.readingAssistanceEntries.set(paragraph, entry);
+            return requestId;
+        }
+
+        showReadingAssistanceResult(paragraph, { requestId, mode = 'simplify', result = {}, sourceLabel = 'Reading assistance', onClose } = {}) {
+            const entry = this.readingAssistanceEntries.get(paragraph);
+            if (!entry || entry.requestId !== requestId || !entry.panel.isConnected) return false;
+            entry.onClose = onClose || entry.onClose;
+            entry.panel.setAttribute('aria-busy', 'false');
+            entry.body.className = 'aw-reading-panel-body';
+            entry.body.replaceChildren();
+            const source = document.createElement('span');
+            source.className = 'aw-reading-source';
+            source.textContent = String(sourceLabel || 'Reading assistance');
+            entry.body.appendChild(source);
+
+            const simplified = String(result.simplified || '').trim();
+            if (simplified) {
+                const label = document.createElement('strong');
+                label.className = 'aw-reading-section-label';
+                label.textContent = mode === 'terms' ? 'Plain-language context' : mode === 'example' ? 'Plain-language explanation' : 'Simpler explanation';
+                const text = document.createElement('p');
+                text.className = 'aw-reading-simplified-text';
+                text.textContent = simplified;
+                entry.body.append(label, text);
+            }
+
+            const keyTerms = Array.isArray(result.keyTerms) ? result.keyTerms : [];
+            if (mode === 'terms' && keyTerms.length > 0) {
+                const label = document.createElement('strong');
+                label.className = 'aw-reading-section-label';
+                label.textContent = 'Key terms';
+                const list = document.createElement('dl');
+                list.className = 'aw-reading-terms';
+                keyTerms.slice(0, 6).forEach(item => {
+                    const term = document.createElement('dt');
+                    term.textContent = String(item?.term || '').trim();
+                    const meaning = document.createElement('dd');
+                    meaning.textContent = String(item?.meaning || '').trim();
+                    if (term.textContent && meaning.textContent) list.append(term, meaning);
+                });
+                if (list.children.length) entry.body.append(label, list);
+            }
+
+            const exampleText = String(result.example || '').trim();
+            if (mode === 'example' && exampleText) {
+                const label = document.createElement('strong');
+                label.className = 'aw-reading-section-label';
+                label.textContent = 'Example';
+                const example = document.createElement('p');
+                example.className = 'aw-reading-example';
+                example.textContent = exampleText;
+                entry.body.append(label, example);
+            }
+
+            const warnings = Array.isArray(result.warnings) ? result.warnings.filter(Boolean).slice(0, 3) : [];
+            if (warnings.length > 0) {
+                const warningList = document.createElement('ul');
+                warningList.className = 'aw-reading-warnings';
+                warnings.forEach(item => {
+                    const warning = document.createElement('li');
+                    warning.textContent = String(item);
+                    warningList.appendChild(warning);
+                });
+                entry.body.appendChild(warningList);
+            }
+
+            const actions = document.createElement('div');
+            actions.className = 'aw-reading-actions aw-reading-result-actions';
+            const toggleOriginal = this.createReadingButton('Use simplified view');
+            toggleOriginal.setAttribute('aria-controls', paragraph.id);
+            toggleOriginal.setAttribute('aria-pressed', 'false');
+            toggleOriginal.addEventListener('click', () => {
+                const hideOriginal = !paragraph.classList.contains('aw-reading-original-hidden');
+                paragraph.classList.toggle('aw-reading-original-hidden', hideOriginal);
+                if (hideOriginal) paragraph.setAttribute('aria-hidden', 'true');
+                else if (entry.originalAriaHidden === null) paragraph.removeAttribute('aria-hidden');
+                else paragraph.setAttribute('aria-hidden', entry.originalAriaHidden);
+                toggleOriginal.textContent = hideOriginal ? 'Show original' : 'Use simplified view';
+                toggleOriginal.setAttribute('aria-pressed', String(hideOriginal));
+            });
+            const closeAndRestore = this.createReadingButton('Close and restore original', 'aw-reading-action aw-reading-action-secondary');
+            closeAndRestore.addEventListener('click', () => this.removeReadingAssistance(paragraph, 'close-and-restore'));
+            actions.append(toggleOriginal, closeAndRestore);
+            entry.body.appendChild(actions);
+            return true;
+        }
+
+        restoreReadingParagraph(entry) {
+            const paragraph = entry?.paragraph;
+            if (!paragraph) return;
+            paragraph.classList.toggle('aw-reading-original-hidden', Boolean(entry.originallyHidden));
+            if (entry.originalAriaHidden === null) paragraph.removeAttribute('aria-hidden');
+            else paragraph.setAttribute('aria-hidden', entry.originalAriaHidden);
+            if (entry.generatedId && paragraph.id) paragraph.removeAttribute('id');
+        }
+
+        removeReadingAssistance(paragraph, reason = 'closed', notify = true) {
+            const entry = this.readingAssistanceEntries.get(paragraph);
+            if (!entry || entry.closed) return false;
+            entry.closed = true;
+            document.removeEventListener('keydown', entry.escapeHandler, true);
+            this.restoreReadingParagraph(entry);
+            entry.panel.remove();
+            this.readingAssistanceEntries.delete(paragraph);
+            if (notify) entry.onClose?.(reason);
+            return true;
+        }
+
+        closeReadingAssistanceWithin(root, reason = 'feature-conflict') {
+            let closed = 0;
+            Array.from(this.readingAssistanceEntries.keys()).forEach(paragraph => {
+                if (root === paragraph || root?.contains?.(paragraph)) {
+                    if (this.removeReadingAssistance(paragraph, reason)) closed += 1;
+                }
+            });
+            return closed;
         }
 
         // 2. Sidebar
