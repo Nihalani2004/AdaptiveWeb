@@ -166,50 +166,471 @@
 
         // --- Feature 1: Reading Difficulty (Re-reading) ---
         initParagraphTracking() {
-            const paragraphs = document.querySelectorAll('p');
-            // Store revisit timestamps: Map<Element, number[]>
-            this.paragraphVisits = new Map();
+            if (this.paragraphTrackingInitialized || typeof IntersectionObserver !== 'function') return;
+            this.paragraphTrackingInitialized = true;
+            this.paragraphStates = new WeakMap();
+            this.observedParagraphs = new Set();
+            this.visibleDifficultyParagraphs = new Set();
+            this.difficultyScrollPositions = new Map();
+            this.difficultyPromptCount = 0;
+            this.difficultyGlobalCooldownUntil = 0;
+            this.difficultyLastInputAt = 0;
+            this.difficultyLastScrollAt = 0;
+            this.difficultyLastScrollDirection = 'none';
+            this.difficultyLastScrollSpeed = 0;
+            this.difficultyMutationTimer = null;
+            this.difficultySelectedParagraph = null;
 
-            // IntersectionObserver to detect when a paragraph enters viewport
-            const observer = new IntersectionObserver((entries) => {
-                const now = Date.now();
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        this.registerVisit(entry.target, now);
-                    }
-                });
-            }, { threshold: 0.8 }); // Must be 80% visible
+            this.difficultyObserver = new IntersectionObserver(
+                entries => this.handleDifficultyIntersections(entries, Date.now()),
+                { threshold: [0, 0.25, CONFIG.difficultyVisibilityRatio] }
+            );
+            this.scanDifficultyParagraphs(document);
 
-            paragraphs.forEach(p => observer.observe(p));
-        }
-
-        registerVisit(p, time) {
-            if (!this.paragraphVisits.has(p)) {
-                this.paragraphVisits.set(p, []);
-            }
-            const visits = this.paragraphVisits.get(p);
-            // Clean old visits
-            while (visits.length > 0 && time - visits[0] > CONFIG.difficultyTimeWindow) {
-                visits.shift();
-            }
-            visits.push(time);
-
-            // Check Trigger
-            if (visits.length >= CONFIG.difficultyRevisitCount) {
-                if (!p.classList.contains('aw-difficulty-processed')) {
-                    this.onReadingDifficulty(p);
-                }
-            }
-        }
-
-        onReadingDifficulty(p) {
-            if (CONFIG.debug) console.log('Detected: Reading Difficulty', p);
-            p.classList.add('aw-difficulty-processed');
-            this.ui.highlightAndPrompt(p, async () => {
-                const simplified = await this.api.simplify(p.innerText);
-                if (simplified) this.ui.updateParagraph(p, simplified.simplified);
+            this.difficultyMutationObserver = typeof MutationObserver === 'function'
+                ? new MutationObserver(mutations => this.handleDifficultyMutations(mutations))
+                : null;
+            this.difficultyMutationObserver?.observe(document.body || document.documentElement, {
+                childList: true,
+                subtree: true,
+                characterData: true
             });
-            this.api.log('reading_difficulty', { text_len: p.innerText.length });
+
+            this.boundDifficultyScroll = event => this.handleDifficultyScroll(event);
+            this.boundDifficultySelection = () => this.handleDifficultySelection();
+            this.boundDifficultyPointerOver = event => this.handleDifficultyPointerOver(event);
+            this.boundDifficultyPointerOut = event => this.handleDifficultyPointerOut(event);
+            this.boundDifficultyInput = () => { this.difficultyLastInputAt = Date.now(); };
+            window.addEventListener('scroll', this.boundDifficultyScroll, { passive: true, capture: true });
+            document.addEventListener('scroll', this.boundDifficultyScroll, { passive: true, capture: true });
+            document.addEventListener('selectionchange', this.boundDifficultySelection);
+            document.addEventListener('pointerover', this.boundDifficultyPointerOver, { passive: true });
+            document.addEventListener('pointerout', this.boundDifficultyPointerOut, { passive: true });
+            document.addEventListener('input', this.boundDifficultyInput, { passive: true });
+            document.addEventListener('keydown', this.boundDifficultyInput, { passive: true });
+
+            window.addEventListener('pagehide', () => this.destroyParagraphTracking(), { once: true });
+        }
+
+        createDifficultyState() {
+            return {
+                visits: [],
+                visible: false,
+                visibleSince: 0,
+                dwellMs: 0,
+                lastExitAt: 0,
+                regressions: 0,
+                selections: 0,
+                lastSelectionAt: 0,
+                pointerSince: 0,
+                pointerDwellMs: 0,
+                prompted: false,
+                assisted: false,
+                dismissedUntil: 0,
+                dwellTimer: null,
+                evaluateTimer: null
+            };
+        }
+
+        getDifficultyState(paragraph) {
+            let state = this.paragraphStates.get(paragraph);
+            if (!state) {
+                state = this.createDifficultyState();
+                this.paragraphStates.set(paragraph, state);
+            }
+            return state;
+        }
+
+        isBaseDifficultyParagraph(paragraph) {
+            if (!paragraph || !paragraph.matches?.('p') || this.isAdaptiveWebElement(paragraph)) return false;
+            const text = String(paragraph.innerText || paragraph.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text.length < CONFIG.difficultyMinChars || text.length > CONFIG.difficultyMaxChars) return false;
+            if (paragraph.closest?.([
+                'form', 'nav', 'table', 'dialog', 'details', '[role="alert"]', '[aria-live]',
+                '[contenteditable="true"]', '[data-no-simplify]', '[data-aw-shortcuts-root]'
+            ].join(','))) return false;
+            const interactiveCount = paragraph.querySelectorAll?.('a, button, input, select, textarea, [role="button"]')?.length || 0;
+            return interactiveCount <= 2;
+        }
+
+        isEligibleDifficultyParagraph(paragraph) {
+            if (!this.isBaseDifficultyParagraph(paragraph) || !paragraph.isConnected) return false;
+            if (paragraph.dataset?.awTldrPrepared === 'true' || paragraph.dataset?.awReadingActive === 'true') return false;
+            if (paragraph.closest?.('.aw-tldr-preview, .aw-reading-assistance-panel, .aw-reading-difficulty-prompt')) return false;
+            return true;
+        }
+
+        scanDifficultyParagraphs(root) {
+            if (!root) return 0;
+            const candidates = [];
+            if (root.matches?.('p')) candidates.push(root);
+            if (root.querySelectorAll) candidates.push(...root.querySelectorAll('p'));
+            let added = 0;
+            candidates.forEach(paragraph => {
+                if (!this.isBaseDifficultyParagraph(paragraph) || this.observedParagraphs.has(paragraph)) return;
+                this.observedParagraphs.add(paragraph);
+                this.difficultyObserver.observe(paragraph);
+                added += 1;
+            });
+            return added;
+        }
+
+        handleDifficultyMutations(mutations) {
+            const addedRoots = [];
+            mutations.forEach(mutation => {
+                Array.from(mutation.removedNodes || []).forEach(node => this.cleanupDifficultyNode(node));
+                Array.from(mutation.addedNodes || []).forEach(node => {
+                    if (node.nodeType === 1) addedRoots.push(node);
+                });
+                if (mutation.type === 'characterData' && mutation.target?.parentElement) {
+                    addedRoots.push(mutation.target.parentElement.closest?.('p') || mutation.target.parentElement);
+                }
+            });
+            if (addedRoots.length === 0) return;
+            if (this.difficultyMutationTimer) clearTimeout(this.difficultyMutationTimer);
+            this.difficultyMutationTimer = setTimeout(() => {
+                addedRoots.forEach(root => this.scanDifficultyParagraphs(root));
+            }, CONFIG.difficultyMutationDelay);
+        }
+
+        cleanupDifficultyNode(node) {
+            if (!node || node.nodeType !== 1) return;
+            const paragraphs = [];
+            if (node.matches?.('p')) paragraphs.push(node);
+            if (node.querySelectorAll) paragraphs.push(...node.querySelectorAll('p'));
+            paragraphs.forEach(paragraph => {
+                if (!this.observedParagraphs.has(paragraph)) return;
+                const state = this.paragraphStates.get(paragraph);
+                if (state?.dwellTimer) clearTimeout(state.dwellTimer);
+                if (state?.evaluateTimer) clearTimeout(state.evaluateTimer);
+                this.difficultyObserver?.unobserve(paragraph);
+                this.observedParagraphs.delete(paragraph);
+                this.visibleDifficultyParagraphs.delete(paragraph);
+                this.ui.dismissReadingDifficultyPromptFor?.(paragraph, 'content-removed');
+                this.ui.removeReadingAssistance?.(paragraph, 'content-removed');
+            });
+        }
+
+        isMeaningfullyVisible(entry) {
+            if (!entry?.isIntersecting) return false;
+            const visibleHeight = Number(entry.intersectionRect?.height || 0);
+            const requiredPixels = Math.min(
+                CONFIG.difficultyVisiblePixels,
+                Math.max(60, Number(window.innerHeight || 600) * 0.25)
+            );
+            return entry.intersectionRatio >= CONFIG.difficultyVisibilityRatio || visibleHeight >= requiredPixels;
+        }
+
+        handleDifficultyIntersections(entries, now = Date.now()) {
+            entries.forEach(entry => {
+                const paragraph = entry.target;
+                const state = this.getDifficultyState(paragraph);
+                const meaningfullyVisible = this.isMeaningfullyVisible(entry) && this.isEligibleDifficultyParagraph(paragraph);
+                if (meaningfullyVisible && !state.visible) {
+                    state.visible = true;
+                    state.visibleSince = now;
+                    state.visits = state.visits.filter(time => now - time <= CONFIG.difficultyTimeWindow);
+                    if (state.visits.length === 0 || (state.lastExitAt && now - state.lastExitAt >= CONFIG.difficultyMinReturnGap)) {
+                        state.visits.push(now);
+                        if (this.difficultyLastScrollDirection === 'up' && now - this.difficultyLastScrollAt <= 2500) {
+                            state.regressions += 1;
+                        }
+                    }
+                    this.visibleDifficultyParagraphs.add(paragraph);
+                    this.scheduleDifficultyDwell(paragraph, state);
+                } else if (!meaningfullyVisible && state.visible) {
+                    state.dwellMs += Math.max(0, now - state.visibleSince);
+                    state.visible = false;
+                    state.visibleSince = 0;
+                    state.lastExitAt = now;
+                    this.visibleDifficultyParagraphs.delete(paragraph);
+                    if (state.dwellTimer) clearTimeout(state.dwellTimer);
+                    state.dwellTimer = null;
+                }
+                this.evaluateReadingDifficulty(paragraph, now);
+            });
+        }
+
+        scheduleDifficultyDwell(paragraph, state) {
+            if (state.dwellTimer) clearTimeout(state.dwellTimer);
+            const elapsed = state.dwellMs + (state.visible ? Date.now() - state.visibleSince : 0);
+            const remaining = Math.max(100, this.getDifficultyDwellThreshold(paragraph) - elapsed);
+            state.dwellTimer = setTimeout(() => {
+                state.dwellTimer = null;
+                if (state.visible) this.evaluateReadingDifficulty(paragraph, Date.now());
+            }, remaining);
+        }
+
+        getDifficultyDwellThreshold(paragraph) {
+            const text = String(paragraph?.innerText || paragraph?.textContent || '').trim();
+            const words = Math.max(1, text.split(/\s+/).filter(Boolean).length);
+            const estimatedReadingMs = words / 200 * 60000;
+            return Math.max(
+                CONFIG.difficultyMinDwell,
+                Math.min(CONFIG.difficultyMaxDwell, estimatedReadingMs * 0.35)
+            );
+        }
+
+        handleDifficultyScroll(event) {
+            const source = this.getScrollSource(event?.target);
+            if (source !== window && this.isAdaptiveWebElement(source)) return;
+            const now = Date.now();
+            const position = source === window
+                ? Number(window.scrollY || document.scrollingElement?.scrollTop || 0)
+                : Number(source?.scrollTop || 0);
+            const previous = this.difficultyScrollPositions.get(source) || { position, time: now };
+            const elapsed = Math.max(1, now - previous.time);
+            const delta = position - previous.position;
+            this.difficultyScrollPositions.set(source, { position, time: now });
+            if (Math.abs(delta) < 8) return;
+            this.difficultyLastScrollAt = now;
+            this.difficultyLastScrollDirection = delta < 0 ? 'up' : 'down';
+            this.difficultyLastScrollSpeed = Math.abs(delta) / elapsed * 1000;
+        }
+
+        handleDifficultySelection() {
+            const selection = window.getSelection?.();
+            const text = selection?.toString?.().trim() || '';
+            if (!text) {
+                const selected = this.difficultySelectedParagraph;
+                this.difficultySelectedParagraph = null;
+                if (selected) this.evaluateReadingDifficulty(selected, Date.now());
+                return;
+            }
+            const node = selection.anchorNode?.nodeType === 1 ? selection.anchorNode : selection.anchorNode?.parentElement;
+            const paragraph = node?.closest?.('p');
+            if (!this.isEligibleDifficultyParagraph(paragraph)) return;
+            const state = this.getDifficultyState(paragraph);
+            const now = Date.now();
+            if (now - state.lastSelectionAt >= 2000) {
+                state.selections += 1;
+                state.lastSelectionAt = now;
+            }
+            this.difficultySelectedParagraph = paragraph;
+        }
+
+        handleDifficultyPointerOver(event) {
+            const paragraph = event.target?.closest?.('p');
+            if (!this.isEligibleDifficultyParagraph(paragraph) || paragraph.contains?.(event.relatedTarget)) return;
+            const state = this.getDifficultyState(paragraph);
+            if (!state.pointerSince) state.pointerSince = Date.now();
+        }
+
+        handleDifficultyPointerOut(event) {
+            const paragraph = event.target?.closest?.('p');
+            if (!paragraph || paragraph.contains?.(event.relatedTarget)) return;
+            const state = this.paragraphStates.get(paragraph);
+            if (!state?.pointerSince) return;
+            state.pointerDwellMs += Math.max(0, Date.now() - state.pointerSince);
+            state.pointerSince = 0;
+            this.evaluateReadingDifficulty(paragraph, Date.now());
+        }
+
+        calculateReadingDifficulty(paragraph, state, now = Date.now()) {
+            const visits = state.visits.filter(time => now - time <= CONFIG.difficultyTimeWindow);
+            const revisitCount = Math.max(0, visits.length - 1);
+            const dwellMs = state.dwellMs + (state.visible && state.visibleSince ? Math.max(0, now - state.visibleSince) : 0);
+            const pointerDwellMs = state.pointerDwellMs + (state.pointerSince ? Math.max(0, now - state.pointerSince) : 0);
+            const requiredRevisits = Math.max(1, CONFIG.difficultyRevisitCount - 1);
+            let score = revisitCount >= requiredRevisits ? 0.30 : revisitCount >= 1 ? 0.15 : 0;
+            if (dwellMs >= this.getDifficultyDwellThreshold(paragraph)) score += 0.25;
+            if (state.regressions >= 1) score += 0.20;
+            if (state.selections >= 1) score += 0.15;
+            if (pointerDwellMs >= CONFIG.difficultyPointerDwell) score += 0.10;
+            return {
+                score: Number(Math.min(1, score).toFixed(2)),
+                revisitCount,
+                dwellMs: Math.round(dwellMs),
+                regressions: state.regressions,
+                selections: state.selections,
+                pointerDwellMs: Math.round(pointerDwellMs)
+            };
+        }
+
+        shouldSuppressReadingDifficulty(paragraph, now = Date.now()) {
+            if (!this.isEligibleDifficultyParagraph(paragraph) || document.hidden) return true;
+            if (this.difficultyPromptCount >= CONFIG.difficultyPromptLimit || now < this.difficultyGlobalCooldownUntil) return true;
+            if (now - this.difficultyLastInputAt < 1800 || now - this.difficultyLastScrollAt < CONFIG.difficultyPostScrollDelay) return true;
+            if (this.difficultyLastScrollSpeed >= CONFIG.skimScrollMinSpeed && now - this.difficultyLastScrollAt < 2500) return true;
+            if (this.activeTldrSource || paragraph.dataset?.awTldrPrepared === 'true') return true;
+            if (this.scrollSummaryInFlight || document.querySelector([
+                '.aw-reading-difficulty-prompt', '.aw-reading-assistance-panel', '.aw-suggestion-bubble', '.aw-summary-box',
+                '.aw-modal-backdrop', '.aw-tldr-prompt', '.aw-tldr-toolbar'
+            ].join(','))) return true;
+            if (window.getSelection?.().toString().trim()) return true;
+            return Array.from(document.querySelectorAll('video, audio')).some(media => !media.paused && !media.ended);
+        }
+
+        evaluateReadingDifficulty(paragraph, now = Date.now()) {
+            const state = this.paragraphStates.get(paragraph);
+            if (!state || state.prompted || state.assisted || now < state.dismissedUntil) return false;
+            const evidence = this.calculateReadingDifficulty(paragraph, state, now);
+            if (evidence.score < CONFIG.difficultyConfidence) return false;
+            if (this.shouldSuppressReadingDifficulty(paragraph, now)) {
+                if (state.evaluateTimer) clearTimeout(state.evaluateTimer);
+                state.evaluateTimer = setTimeout(() => {
+                    state.evaluateTimer = null;
+                    this.evaluateReadingDifficulty(paragraph, Date.now());
+                }, Math.max(900, CONFIG.difficultyPostScrollDelay));
+                return false;
+            }
+            this.onReadingDifficulty(paragraph, evidence);
+            return true;
+        }
+
+        onReadingDifficulty(paragraph, evidence) {
+            const state = this.getDifficultyState(paragraph);
+            if (state.prompted || state.assisted) return false;
+            state.prompted = true;
+            this.difficultyPromptCount += 1;
+            this.difficultyGlobalCooldownUntil = Date.now() + CONFIG.difficultyGlobalCooldown;
+            paragraph.dataset.awReadingActive = 'true';
+            paragraph.classList.add('aw-reading-difficulty-detected');
+            this.ui.removeHoverEffect?.(paragraph);
+
+            const shown = this.ui.showReadingDifficultyPrompt(paragraph, {
+                onAction: mode => {
+                    state.prompted = false;
+                    state.assisted = true;
+                    this.requestReadingAssistance(paragraph, mode, evidence);
+                },
+                onDismiss: reason => {
+                    state.prompted = false;
+                    state.dismissedUntil = Date.now() + CONFIG.difficultyPromptCooldown;
+                    paragraph.classList.remove('aw-reading-difficulty-detected');
+                    delete paragraph.dataset.awReadingActive;
+                    this.api.log('reading_assistance_dismissed', { reason, confidence: evidence.score });
+                }
+            });
+            if (!shown) {
+                state.prompted = false;
+                paragraph.classList.remove('aw-reading-difficulty-detected');
+                delete paragraph.dataset.awReadingActive;
+                return false;
+            }
+            this.api.log('reading_difficulty_detected', {
+                confidence: evidence.score,
+                revisit_count: evidence.revisitCount,
+                dwell_ms: evidence.dwellMs,
+                regression_count: evidence.regressions,
+                selection_count: evidence.selections,
+                pointer_dwell_ms: evidence.pointerDwellMs,
+                text_len: String(paragraph.innerText || '').length
+            });
+            return true;
+        }
+
+        async requestReadingAssistance(paragraph, mode, evidence) {
+            const originalText = String(paragraph.innerText || paragraph.textContent || '').replace(/\s+/g, ' ').trim();
+            const local = this.buildLocalReadingAssistance(originalText, mode);
+            const requestId = this.ui.showReadingAssistanceLoading(paragraph, {
+                mode,
+                onClose: reason => this.finishReadingAssistance(paragraph, reason)
+            });
+            if (requestId === null) {
+                this.finishReadingAssistance(paragraph, 'content-unavailable');
+                return;
+            }
+            try {
+                const redactedText = this.redactSensitiveText(originalText).slice(0, CONFIG.difficultyMaxChars);
+                const response = await this.api.simplify(redactedText, mode);
+                const useGemini = Boolean(response?.simplified && String(response.method || '').startsWith('gemini'));
+                const result = useGemini ? response : local;
+                this.ui.showReadingAssistanceResult(paragraph, {
+                    requestId,
+                    mode,
+                    result,
+                    sourceLabel: useGemini ? 'Gemini explanation' : 'Local explanation',
+                    onClose: reason => this.finishReadingAssistance(paragraph, reason)
+                });
+                this.api.log('reading_assistance_shown', {
+                    mode,
+                    method: useGemini ? 'gemini' : 'local',
+                    confidence: evidence.score,
+                    text_len: originalText.length
+                });
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb reading assistance used local fallback', error);
+                this.ui.showReadingAssistanceResult(paragraph, {
+                    requestId,
+                    mode,
+                    result: local,
+                    sourceLabel: 'Local explanation',
+                    onClose: reason => this.finishReadingAssistance(paragraph, reason)
+                });
+            }
+        }
+
+        buildLocalReadingAssistance(text, mode = 'simplify') {
+            const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+            const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map(sentence => sentence.trim()).filter(Boolean) || [normalized];
+            const seenTerms = new Set();
+            const terms = (normalized.match(/\b[A-Za-z][A-Za-z'-]{8,}\b/g) || [])
+                .sort((a, b) => b.length - a.length)
+                .filter(term => {
+                    const identity = term.toLowerCase();
+                    if (seenTerms.has(identity)) return false;
+                    seenTerms.add(identity);
+                    return true;
+                })
+                .slice(0, 5)
+                .map(term => ({
+                    term,
+                    meaning: 'This term appears in the original paragraph; review it in its surrounding sentence.'
+                }));
+            const example = sentences.find(sentence => /\b(for example|such as|because|means|therefore|allows|helps)\b|\d/i.test(sentence)) || sentences[0] || normalized;
+            const warnings = mode === 'terms'
+                ? ['AI was unavailable, so detected terms are shown without invented definitions.']
+                : mode === 'example'
+                    ? ['AI was unavailable, so a concrete source sentence is shown instead of an invented example.']
+                    : ['AI was unavailable, so the original wording is preserved and separated into readable sentences.'];
+            return {
+                simplified: sentences.join('\n\n'),
+                keyTerms: terms,
+                example: String(example || '').slice(0, 600),
+                warnings,
+                method: 'local_fallback',
+                mode
+            };
+        }
+
+        finishReadingAssistance(paragraph, reason = 'closed') {
+            const state = this.paragraphStates.get(paragraph);
+            if (state) {
+                state.assisted = false;
+                state.dismissedUntil = Date.now() + CONFIG.difficultyPromptCooldown;
+            }
+            paragraph?.classList?.remove('aw-reading-difficulty-detected');
+            if (paragraph?.dataset) delete paragraph.dataset.awReadingActive;
+            this.api.log('reading_assistance_closed', { reason });
+        }
+
+        closeReadingAssistanceForRoot(root, reason = 'feature-conflict') {
+            this.ui.dismissReadingDifficultyPrompt?.(reason);
+            this.ui.closeReadingAssistanceWithin?.(root, reason);
+        }
+
+        destroyParagraphTracking() {
+            this.ui.dismissReadingDifficultyPrompt?.('page-unloaded');
+            this.ui.closeReadingAssistanceWithin?.(document, 'page-unloaded');
+            this.difficultyObserver?.disconnect();
+            this.difficultyMutationObserver?.disconnect();
+            if (this.difficultyMutationTimer) clearTimeout(this.difficultyMutationTimer);
+            this.observedParagraphs?.forEach(paragraph => {
+                const state = this.paragraphStates.get(paragraph);
+                if (state?.dwellTimer) clearTimeout(state.dwellTimer);
+                if (state?.evaluateTimer) clearTimeout(state.evaluateTimer);
+            });
+            this.observedParagraphs?.clear();
+            this.visibleDifficultyParagraphs?.clear();
+            this.difficultyScrollPositions?.clear();
+            window.removeEventListener('scroll', this.boundDifficultyScroll, true);
+            document.removeEventListener('scroll', this.boundDifficultyScroll, true);
+            document.removeEventListener('selectionchange', this.boundDifficultySelection);
+            document.removeEventListener('pointerover', this.boundDifficultyPointerOver);
+            document.removeEventListener('pointerout', this.boundDifficultyPointerOut);
+            document.removeEventListener('input', this.boundDifficultyInput);
+            document.removeEventListener('keydown', this.boundDifficultyInput);
         }
 
         // --- Feature 2 & 3: Scroll-back Summary, Rapid Skim, and Engaged Reader ---
