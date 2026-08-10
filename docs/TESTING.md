@@ -2,7 +2,19 @@
 
 ## Functional Testing
 
-### Feature 1: Hover Dwell
+### Feature 1: Reading-Difficulty Assistance
+
+- **Action**: On a long paragraph (at least 180 characters), read it for several seconds, leave it, and meaningfully return to it twice. Upward regression, selecting its text, or dwelling the pointer over it provide additional evidence.
+- **Expected**: Once the combined confidence reaches 0.70, a non-blocking prompt appears after the paragraph with `Simplify`, `Explain terms`, `Show example`, and `Not now`. Detection alone must never send text to the backend or change the paragraph.
+- **Verification**: Check `.aw-reading-difficulty-prompt.aw-visible` exists. Select each mode and verify `.aw-reading-assistance-panel` first announces a loading state and then displays a `Gemini explanation` or `Local explanation` badge.
+- **Original preservation**: Select `Use simplified view`, then `Show original`, and finally `Close and restore original`. The paragraph's original nodes and text must remain intact throughout and `aria-hidden` must be restored to its prior value.
+- **False-positive checks**: A single read, fast skimming, recent typing or scrolling, text selection elsewhere, active media, short text, forms, navigation, tables, editable content, hidden tabs, and existing AdaptiveWeb overlays must not trigger a prompt.
+- **Dynamic pages**: Add a qualifying paragraph after initial load, verify it becomes observed, then remove it and verify its assistance UI and timers are cleaned up.
+- **Coordination**: Activating TL;DR must close reading assistance in that content root. Reading assistance must suppress competing cursor, scroll-summary, and exit-intent overlays while open.
+- **Accessibility**: Verify the prompt and result are keyboard reachable, Escape closes them, focus indicators are visible, loading is announced through `aria-live`, and reduced-motion preference disables prompt animation.
+- **Backend contract**: For all three modes, verify the response includes `simplified`, `keyTerms`, `example`, `warnings`, `method`, and `mode`. Model output missing source names or numbers must be rejected in favor of the complete local fallback.
+
+### Hover Dwell
 - **Action**: Hover over a paragraph (>50px size) for 1.5 seconds.
 - **Expected**: A yellow highlight appears.
 - **Verification**: Check `injected.css` class `.aw-highlighted` is applied.
