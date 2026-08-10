@@ -19,11 +19,12 @@ if not GEMINI_API_KEY:
     print("[WARNING] GEMINI_API_KEY not found in environment variables.")
 
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 model = genai.GenerativeModel(GEMINI_MODEL)
 
 SUGGESTION_ACTION_TYPES = {"highlight", "focus", "compare", "activate"}
 SHORTCUT_ACTION_TYPES = {"focus", "activate", "scroll_top", "scroll_bottom", "toggle_shortcuts"}
+SIMPLIFY_MODES = {"simplify", "terms", "example"}
 UNSAFE_ACTION_PATTERN = re.compile(
     r"\b(delete|remove|purchase|pay|checkout|buy|submit|send|publish|transfer|"
     r"confirm order|place order|sign out|log out|unsubscribe|close account|cancel account)\b",
@@ -307,6 +308,121 @@ def parse_shortcut_response(content, request_text, method="gemini_grounded"):
     except (TypeError, ValueError, json.JSONDecodeError):
         return _local_shortcut_fallback(context, "local_fallback_parse")
     return _validate_shortcut_payload(payload, context, method)
+
+
+def _split_reading_sentences(text):
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+    return [sentence.strip() for sentence in re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", normalized) if sentence.strip()]
+
+
+def _extract_local_key_terms(text, limit=5):
+    words = re.findall(r"\b[A-Za-z][A-Za-z'-]{8,}\b", str(text or ""))
+    seen = set()
+    terms = []
+    for word in sorted(words, key=lambda value: (-len(value), value.lower())):
+        identity = word.lower()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        terms.append({
+            "term": word[:80],
+            "meaning": "This term appears in the original paragraph; review it in its surrounding sentence.",
+        })
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def build_local_simplification(text, mode="simplify", method="local_fallback"):
+    """Create a complete, non-inventive fallback without discarding source sentences."""
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    sentences = _split_reading_sentences(normalized)
+    readable_text = "\n\n".join(sentences) if sentences else normalized
+    example_sentence = next(
+        (
+            sentence for sentence in sentences
+            if re.search(r"\b(for example|such as|because|means|therefore|allows|helps)\b|\d", sentence, re.IGNORECASE)
+        ),
+        sentences[0] if sentences else normalized,
+    )
+    warnings = [
+        "AI was unavailable, so AdaptiveWeb preserved the original wording and only improved its layout."
+    ]
+    if mode == "terms":
+        warnings = [
+            "AI was unavailable, so detected terms are shown without invented definitions."
+        ]
+    elif mode == "example":
+        warnings = [
+            "AI was unavailable, so AdaptiveWeb selected a concrete source sentence instead of inventing an example."
+        ]
+    return {
+        "simplified": readable_text,
+        "keyTerms": _extract_local_key_terms(normalized),
+        "example": _bounded_text(example_sentence, 600),
+        "warnings": warnings,
+        "method": method,
+        "mode": mode if mode in SIMPLIFY_MODES else "simplify",
+        "originalLength": len(normalized),
+        "structured": True,
+    }
+
+
+def _critical_reading_facts(text):
+    source = str(text or "")
+    numeric = re.findall(r"(?:[$€£₹]\s*)?\b\d[\d,./:%-]*\b", source)
+    named = re.findall(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b", source)
+    return {fact.strip().lower() for fact in numeric + named if fact.strip()}
+
+
+def _validate_simplification_payload(payload, original_text, mode, method="gemini_structured"):
+    if not isinstance(payload, dict):
+        return build_local_simplification(original_text, mode, "local_fallback_parse")
+    simplified = _bounded_text(payload.get("simplified"), 6500)
+    combined = " ".join([
+        simplified,
+        _bounded_text(payload.get("example"), 600),
+        json.dumps(payload.get("keyTerms", []), ensure_ascii=False),
+    ]).lower()
+    missing_facts = [fact for fact in _critical_reading_facts(original_text) if fact not in combined]
+    if len(simplified) < 30 or missing_facts:
+        return build_local_simplification(original_text, mode, "local_fallback_validation")
+
+    key_terms = []
+    raw_terms = payload.get("keyTerms", [])
+    if isinstance(raw_terms, list):
+        for item in raw_terms[:5]:
+            if not isinstance(item, dict):
+                continue
+            term = _bounded_text(item.get("term"), 80)
+            meaning = _bounded_text(item.get("meaning"), 240)
+            if term and meaning:
+                key_terms.append({"term": term, "meaning": meaning})
+
+    warnings = []
+    raw_warnings = payload.get("warnings", [])
+    if isinstance(raw_warnings, list):
+        warnings = [_bounded_text(item, 220) for item in raw_warnings[:3] if _bounded_text(item, 220)]
+    return {
+        "simplified": simplified,
+        "keyTerms": key_terms,
+        "example": _bounded_text(payload.get("example"), 600),
+        "warnings": warnings,
+        "method": method,
+        "mode": mode,
+        "originalLength": len(str(original_text or "").strip()),
+        "structured": True,
+    }
+
+
+def parse_simplification_response(content, original_text, mode="simplify", method="gemini_structured"):
+    try:
+        payload = json.loads(_strip_json_fence(content))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return build_local_simplification(original_text, mode, "local_fallback_parse")
+    return _validate_simplification_payload(payload, original_text, mode, method)
 
 # In-memory storage for demo fallback
 mock_events = []
