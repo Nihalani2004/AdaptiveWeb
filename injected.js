@@ -4,7 +4,21 @@
     const CONFIG = {
         // Feature 1: Reading Difficulty
         difficultyRevisitCount: 3,
-        difficultyTimeWindow: 10000, // 10s
+        difficultyTimeWindow: 60000,
+        difficultyMinReturnGap: 1200,
+        difficultyMinChars: 180,
+        difficultyMaxChars: 6000,
+        difficultyMinDwell: 4000,
+        difficultyMaxDwell: 12000,
+        difficultyVisibilityRatio: 0.45,
+        difficultyVisiblePixels: 140,
+        difficultyPointerDwell: 2500,
+        difficultyConfidence: 0.7,
+        difficultyPromptCooldown: 90000,
+        difficultyGlobalCooldown: 30000,
+        difficultyPromptLimit: 3,
+        difficultyPostScrollDelay: 700,
+        difficultyMutationDelay: 250,
 
         // Feature 2: Engaged Reader
         engagedScrollMaxSpeed: 300, // px/s
