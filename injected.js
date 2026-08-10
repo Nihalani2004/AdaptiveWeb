@@ -971,7 +971,7 @@
         shouldSuppressScrollSummary(source) {
             if (this.scrollSummaryInFlight || document.hidden) return true;
             if (this.getScrollSummaryCount() >= CONFIG.scrollSummarySessionLimit) return true;
-            if (document.querySelector('.aw-summary-box, .aw-modal-backdrop')) return true;
+            if (document.querySelector('.aw-summary-box, .aw-modal-backdrop, .aw-reading-difficulty-prompt, .aw-reading-assistance-panel')) return true;
             if (window.getSelection && window.getSelection().toString().trim()) return true;
             if (source !== window && (!source || !source.isConnected)) return true;
             const activeMedia = Array.from(document.querySelectorAll('video, audio'))
@@ -1117,6 +1117,7 @@
                 ? document.querySelector('main, article') || document.body
                 : source;
             if (!root || !root.querySelectorAll) return false;
+            this.closeReadingAssistanceForRoot(root, 'tldr-started');
 
             if (!this.tldrSessions) this.tldrSessions = new Map();
             if (this.activeTldrSource && this.activeTldrSource !== source) {
@@ -1174,7 +1175,7 @@
             const candidates = Array.from(root.querySelectorAll('p')).filter(paragraph => {
                 const text = String(paragraph.innerText || paragraph.textContent || '').replace(/\s+/g, ' ').trim();
                 if (text.length < CONFIG.tldrMinParagraphChars) return false;
-                if (this.isAdaptiveWebElement(paragraph) || paragraph.dataset?.awTldrPrepared === 'true') return false;
+                if (this.isAdaptiveWebElement(paragraph) || paragraph.dataset?.awTldrPrepared === 'true' || paragraph.dataset?.awReadingActive === 'true') return false;
                 if (paragraph.closest?.('form, nav, table, details, [role="alert"], [aria-live], [contenteditable="true"]')) return false;
                 if (paragraph.matches?.('.lead, .intro, .summary, [data-no-tldr]')) return false;
                 if (/^(warning|important|conclusion|key takeaway|summary)\b/i.test(text)) return false;
@@ -2188,7 +2189,7 @@
             if (document.hidden || now < tracker.cooldownUntil) return true;
             if (tracker.state === 'assisting') return true;
             if (this.getCursorPromptCount() >= CONFIG.cursorPromptLimit) return true;
-            if (document.querySelector('.aw-suggestion-bubble, .aw-modal-backdrop')) return true;
+            if (document.querySelector('.aw-suggestion-bubble, .aw-modal-backdrop, .aw-reading-difficulty-prompt, .aw-reading-assistance-panel')) return true;
             if (document.querySelector('.aw-highlight, .aw-hover-light, .aw-hover-dark')) return true;
             if (window.getSelection && window.getSelection().toString().trim()) return true;
             if (now - tracker.lastInputAt < 1800) return true;
@@ -2265,7 +2266,8 @@
                 '.aw-shortcuts-sidebar',
                 '.aw-modal-backdrop',
                 '.aw-summarize-btn',
-                '.aw-simplify-btn',
+                '.aw-reading-difficulty-prompt',
+                '.aw-reading-assistance-panel',
                 '.aw-tldr-read-more'
             ].join(',')));
         }
@@ -2627,7 +2629,7 @@
 
         onExitIntent() {
             if (this.exitTriggered) return;
-            if (document.querySelector('.aw-suggestion-bubble')) return;
+            if (document.querySelector('.aw-suggestion-bubble, .aw-reading-difficulty-prompt, .aw-reading-assistance-panel')) return;
             // Check session storage to prevent annoyance
             if (sessionStorage.getItem('aw-exit-dismissed')) return;
 
