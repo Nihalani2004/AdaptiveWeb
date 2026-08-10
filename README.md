@@ -37,6 +37,19 @@ Unlike traditional personalization tools, AdaptiveWeb:
 
 ## ✨ Key Features
 
+### 📖 Reading-Difficulty Assistance
+
+Offers help only after multiple on-device signals indicate that a long paragraph may need extra attention.
+
+* Signals: Meaningful revisits, reading-time-adjusted dwell, upward regression, text selection, and pointer dwell are combined into a confidence score
+* Guards: Short or highly interactive content, forms, navigation, editable regions, active media, rapid skimming, recent input, existing overlays, cooldowns, and hidden tabs are excluded
+* Choice: The user can select **Simplify**, **Explain terms**, **Show example**, or **Not now**; no paragraph is changed automatically
+* Result: Gemini returns a structured, fact-preserving aid when available; a clearly labeled, non-inventive local fallback preserves and reformats the complete source when it is not
+* Safety: The original paragraph remains in the DOM and can be shown, hidden, or fully restored; dynamically added paragraphs are observed and removed content is cleaned up
+* Accessibility: Semantic regions, live loading status, keyboard controls, Escape dismissal, focus indicators, high-contrast colors, and reduced-motion styles are included
+
+---
+
 ### 🎨 Hover Dwell Highlight
 
 Highlights content the user is actively reading.
@@ -231,6 +244,7 @@ Run the frontend demo with `npm run dev` from `frontend`, start the FastAPI back
 
 Test scenarios:
 
+* Repeated paragraph attention → optional reading assistance
 * Hover dwell → highlight
 * Scroll back → summary
 * Rapid scroll → TL;DR
