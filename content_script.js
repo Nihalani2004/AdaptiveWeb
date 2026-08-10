@@ -27,7 +27,7 @@
       const allowedEndpoints = new Set(['suggest', 'analytics', 'simplify', 'summarize', 'related', 'shortcuts']);
       if (!allowedEndpoints.has(endpoint) || typeof requestId !== 'string') return;
       const controller = new AbortController();
-      const longAiRequest = endpoint === 'suggest' || endpoint === 'summarize';
+      const longAiRequest = endpoint === 'suggest' || endpoint === 'summarize' || endpoint === 'simplify';
       const timeoutId = setTimeout(() => controller.abort(), longAiRequest ? 16000 : 7000);
       try {
         const response = await fetch(`http://localhost:8000/api/${endpoint}`, {

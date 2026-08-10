@@ -2673,8 +2673,8 @@
             });
         }
 
-        async simplify(text) {
-            return this.post('simplify', { text });
+        async simplify(text, mode = 'simplify') {
+            return this.post('simplify', { text, mode }, 15000);
         }
 
         async summarize(text) {
