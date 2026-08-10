@@ -76,7 +76,7 @@
             this.api = new ApiService();
 
             this.initScrollAnalysis();
-            // this.initParagraphTracking(); // Disable "Simplify" feature as requested
+            this.initParagraphTracking();
             this.initExitIntent();
             this.initHoverDwell(); // New Universal Hover
         }
