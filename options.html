@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AdaptiveWeb extension settings</title><link rel="stylesheet" href="options.css"></head>
+<body>
+  <main>
+    <div class="brand"><span>AW</span><div><h1>AdaptiveWeb</h1><p>Secure preference sync</p></div></div>
+    <section id="pair-section">
+      <h2>Connect your account</h2>
+      <p>Open AdaptiveWeb Settings while signed in, generate a one-time code, then enter it here. Your password is never shared with the extension.</p>
+      <label>AdaptiveWeb server<input id="server" type="url" value="http://localhost:3000" spellcheck="false"></label>
+      <label>Pairing code<input id="code" inputmode="text" maxlength="12" autocomplete="one-time-code" placeholder="A1B2C3D4E5"></label>
+      <button id="pair">Connect extension</button>
+    </section>
+    <section id="connected-section" hidden>
+      <h2>Connected</h2><p id="account"></p><p id="last-sync" class="muted"></p>
+      <div class="actions"><button id="sync">Sync now</button><button id="disconnect" class="danger">Disconnect</button></div>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

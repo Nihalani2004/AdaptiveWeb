@@ -5,7 +5,9 @@
   "description": "Adaptive browsing assistance with grounded keyboard shortcuts, cursor guidance, compact reading, and scroll-back summaries.",
   "permissions": [
     "activeTab",
-    "scripting"
+    "scripting",
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -21,6 +23,13 @@
       "run_at": "document_idle"
     }
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "web_accessible_resources": [
     {
       "resources": [

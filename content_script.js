@@ -17,11 +17,29 @@
   script.src = chrome.runtime.getURL('injected.js');
   script.onload = function() {
     this.remove();
+    sendPreferencesToPage();
   };
   (document.head || document.documentElement).appendChild(script);
 
+  function sendPreferencesToPage() {
+    chrome.runtime.sendMessage({ type: 'AW_GET_PREFERENCES' }, function(response) {
+      if (chrome.runtime.lastError || !response?.ok || !response.preferences) return;
+      window.postMessage({ type: 'AW_PREFERENCES_UPDATE', preferences: response.preferences }, '*');
+    });
+  }
+
+  chrome.storage.onChanged.addListener(function(changes, area) {
+    if (area === 'local' && changes.awPreferencesCache?.newValue) {
+      window.postMessage({ type: 'AW_PREFERENCES_UPDATE', preferences: changes.awPreferencesCache.newValue }, '*');
+    }
+  });
+
   // API Proxy Listener to prevent HTTPS Mixed Content errors
   window.addEventListener('message', async function(event) {
+    if (event.source === window && event.data?.type === 'AW_REQUEST_PREFERENCES') {
+      sendPreferencesToPage();
+      return;
+    }
     if (event.source === window && event.data && event.data.type === 'AW_API_REQUEST') {
       const { requestId, endpoint, body } = event.data;
       const allowedEndpoints = new Set(['suggest', 'analytics', 'simplify', 'summarize', 'related', 'shortcuts']);
