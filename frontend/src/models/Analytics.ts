@@ -4,7 +4,7 @@ export interface IAnalytics extends Document {
     eventType: 'hover' | 'scroll_back' | 'skim' | 'hesitation';
     domain: string;
     timestamp: Date;
-    metadata?: any;
+    metadata?: Record<string, unknown>;
 }
 
 const AnalyticsSchema: Schema = new Schema({

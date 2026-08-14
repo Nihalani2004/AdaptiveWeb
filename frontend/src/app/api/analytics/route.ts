@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import dbConnect from '@/lib/db';
 import Analytics from '@/models/Analytics';
+import { getCurrentUser } from '@/lib/auth';
 
 export async function POST(request: Request) {
     try {
@@ -8,13 +9,15 @@ export async function POST(request: Request) {
         const body = await request.json();
         const event = await Analytics.create(body);
         return NextResponse.json({ success: true, data: event });
-    } catch (error) {
+    } catch {
         return NextResponse.json({ success: false }, { status: 500 });
     }
 }
 
 export async function GET() {
     try {
+        const user = await getCurrentUser();
+        if (!user) return NextResponse.json({ success: false, error: 'Authentication required.' }, { status: 401 });
         await dbConnect();
         // Aggregation for Dashboard Charts
 
@@ -36,7 +39,7 @@ export async function GET() {
                 byType
             }
         });
-    } catch (error) {
-        return NextResponse.json({ success: false }, { status: 500 });
+    } catch {
+        return NextResponse.json({ success: false, error: 'Unable to load analytics.' }, { status: 500 });
     }
 }

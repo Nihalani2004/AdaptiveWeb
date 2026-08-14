@@ -2,22 +2,26 @@
 
 import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { BarChart2, TrendingUp, Users, Activity, Eye, MousePointer2 } from 'lucide-react';
+import { TrendingUp, Users, Activity, Eye, MousePointer2, type LucideIcon } from 'lucide-react';
 
 // Mock Data for Charts (since we might not have real data yet)
 const ACTIVITY_DATA = [40, 60, 45, 80, 55, 90, 70];
 
 export default function DashboardPage() {
-    const [stats, setStats] = useState<any>(null);
+    const [stats, setStats] = useState<{ total: number; byType: Array<{ _id: string; count: number }> } | null>(null);
+    const [error, setError] = useState('');
 
     useEffect(() => {
         // Fetch stats from API
-        fetch('http://localhost:8000/api/analytics')
-            .then(res => res.json())
+        fetch('/api/analytics')
+            .then(res => {
+                if (!res.ok) throw new Error('Unable to load dashboard analytics.');
+                return res.json();
+            })
             .then(data => {
                 if (data.success) setStats(data.stats);
             })
-            .catch(err => console.error(err));
+            .catch(err => setError(err instanceof Error ? err.message : 'Unable to load analytics.'));
     }, []);
 
     return (
@@ -25,14 +29,15 @@ export default function DashboardPage() {
             {/* Header */}
             <header className="mb-10">
                 <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-2">Overview</h1>
-                <p className="text-slate-500 dark:text-slate-400">Welcome back, Mayank. Here's how AdaptiveWeb is performing.</p>
+                <p className="text-slate-500 dark:text-slate-400">Here&apos;s how AdaptiveWeb is performing.</p>
+                {error && <p role="alert" className="text-red-600 mt-2">{error}</p>}
             </header>
 
             {/* Stats Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
                 <StatCard
                     title="Total Adaptations"
-                    value={stats?.total || 1284}
+                    value={stats?.total ?? 0}
                     trend="+12.5%"
                     icon={Activity}
                     color="blue"
@@ -46,14 +51,14 @@ export default function DashboardPage() {
                 />
                 <StatCard
                     title="Hover Events"
-                    value={stats?.byType?.find((t: any) => t._id === 'hover')?.count || 432}
+                    value={stats?.byType?.find((event) => event._id === 'hover')?.count ?? 0}
                     trend="+8.1%"
                     icon={Eye}
                     color="orange"
                 />
                 <StatCard
                     title="Hesitation Solved"
-                    value={stats?.byType?.find((t: any) => t._id === 'hesitation')?.count || 156}
+                    value={stats?.byType?.find((event) => event._id === 'hesitation')?.count ?? 0}
                     trend="+2.4%"
                     icon={MousePointer2}
                     color="pink"
@@ -114,8 +119,10 @@ export default function DashboardPage() {
     );
 }
 
-function StatCard({ title, value, trend, icon: Icon, color }: any) {
-    const colors: any = {
+interface StatCardProps { title: string; value: string | number; trend: string; icon: LucideIcon; color: 'blue' | 'violet' | 'orange' | 'pink' }
+
+function StatCard({ title, value, trend, icon: Icon, color }: StatCardProps) {
+    const colors: Record<StatCardProps['color'], string> = {
         blue: "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10",
         violet: "text-violet-600 dark:text-violet-400 bg-violet-50 dark:bg-violet-500/10",
         orange: "text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-500/10",
