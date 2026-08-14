@@ -1273,3 +1273,21 @@ button.aw-suggestion-card:focus-visible {
     scroll-behavior: auto !important;
   }
 }
+html[data-aw-motion="reduce"] .aw-suggestion-bubble,
+html[data-aw-motion="reduce"] .aw-summary-box,
+html[data-aw-motion="reduce"] .aw-reading-difficulty-prompt,
+html[data-aw-motion="reduce"] .aw-reading-assistance-panel,
+html[data-aw-motion="reduce"] .aw-tldr-toolbar,
+html[data-aw-motion="reduce"] [class*="aw-"] {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html[data-aw-motion="system"] [class*="aw-"] {
+        animation: none !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}

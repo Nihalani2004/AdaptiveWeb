@@ -70,15 +70,74 @@
         debug: true
     };
 
+    const AW_DEFAULT_PREFERENCES = {
+        schemaVersion: 1,
+        features: {
+            hoverAssistance: { enabled: true, delayMs: 1500 },
+            readingAssistance: { enabled: true },
+            scrollBackSummary: { enabled: true, returnWindowMs: 18000 },
+            compactReading: { mode: 'ask' },
+            cursorAssistance: { enabled: true },
+            keyboardShortcuts: { enabled: true },
+            exitIntent: { enabled: false }
+        },
+        ai: { allowGemini: true },
+        accessibility: { reducedMotion: 'system' }
+    };
+    let AW_PREFERENCES = JSON.parse(JSON.stringify(AW_DEFAULT_PREFERENCES));
+
+    function normalizeRuntimePreferences(value) {
+        try {
+            if (!value || value.schemaVersion !== 1 || !value.features || !value.ai || !value.accessibility) return null;
+            const f = value.features;
+            const booleans = [f.hoverAssistance?.enabled, f.readingAssistance?.enabled, f.scrollBackSummary?.enabled,
+                f.cursorAssistance?.enabled, f.keyboardShortcuts?.enabled, f.exitIntent?.enabled, value.ai.allowGemini];
+            if (booleans.some(item => typeof item !== 'boolean')) return null;
+            const delayMs = Number(f.hoverAssistance.delayMs);
+            const returnWindowMs = Number(f.scrollBackSummary.returnWindowMs);
+            if (!Number.isInteger(delayMs) || delayMs < 500 || delayMs > 10000) return null;
+            if (!Number.isInteger(returnWindowMs) || returnWindowMs < 5000 || returnWindowMs > 60000) return null;
+            if (!['ask', 'automatic', 'off'].includes(f.compactReading?.mode)) return null;
+            if (!['system', 'reduce', 'full'].includes(value.accessibility.reducedMotion)) return null;
+            return JSON.parse(JSON.stringify(value));
+        } catch { return null; }
+    }
+
     class BehaviorDetector {
         constructor(ui) {
             this.ui = ui;
             this.api = new ApiService();
+            this.preferences = AW_PREFERENCES;
 
             this.initScrollAnalysis();
             this.initParagraphTracking();
             this.initExitIntent();
             this.initHoverDwell(); // New Universal Hover
+        }
+
+        setPreferences(preferences) {
+            const valid = normalizeRuntimePreferences(preferences);
+            if (!valid) return false;
+            this.preferences = AW_PREFERENCES = valid;
+            CONFIG.scrollReturnWindow = valid.features.scrollBackSummary.returnWindowMs;
+            document.documentElement.setAttribute('data-aw-motion', valid.accessibility.reducedMotion);
+            if (!valid.features.hoverAssistance.enabled) {
+                document.querySelectorAll('.aw-hover-light, .aw-hover-dark').forEach(element => this.ui.removeHoverEffect?.(element));
+            }
+            if (!valid.features.readingAssistance.enabled) {
+                document.querySelectorAll('.aw-reading-icon-button, .aw-reading-action-secondary').forEach(button => button.click?.());
+            }
+            if (!valid.features.cursorAssistance.enabled) document.querySelector('.aw-suggestion-close')?.click?.();
+            if (!valid.features.scrollBackSummary.enabled) document.querySelector('.aw-summary-dismiss-btn')?.click?.();
+            if (valid.features.compactReading.mode === 'off') {
+                Array.from(this.tldrSessions?.keys?.() || []).forEach(source => this.restoreRapidSkimMode(source, 'preference-disabled'));
+                this.ui.dismissTldrPrompt?.('preference-disabled');
+            }
+            return true;
+        }
+
+        featureEnabled(name) {
+            return Boolean((this.preferences || AW_PREFERENCES)?.features?.[name]?.enabled);
         }
 
         // --- Feature 5: Universal Hover Dwell ---
@@ -87,6 +146,7 @@
             let currentTarget = null;
 
             document.body.addEventListener('mouseover', (e) => {
+                if (!this.featureEnabled('hoverAssistance')) return;
                 const target = e.target.closest('p, article, h1, h2, h3, li');
                 if (!target || target.dataset?.awReadingActive === 'true' || this.isAdaptiveWebElement(target) || target === currentTarget) return;
 
@@ -101,7 +161,7 @@
                     if (currentTarget && currentTarget.isConnected) {
                         this.onHoverDwell(currentTarget);
                     }
-                }, 1500);
+                }, (this.preferences || AW_PREFERENCES).features.hoverAssistance.delayMs);
             }, { passive: true });
 
             document.body.addEventListener('mouseout', (e) => {
@@ -124,6 +184,7 @@
         }
 
         onHoverDwell(element) {
+            if (!this.featureEnabled('hoverAssistance')) return;
             if (CONFIG.debug) console.log('Detected: Universal Hover Dwell', element);
 
             // Smarter Theme Detection: Traverse up to find effective background
@@ -448,6 +509,7 @@
         }
 
         shouldSuppressReadingDifficulty(paragraph, now = Date.now()) {
+            if (!this.featureEnabled('readingAssistance')) return true;
             if (!this.isEligibleDifficultyParagraph(paragraph) || document.hidden) return true;
             if (this.difficultyPromptCount >= CONFIG.difficultyPromptLimit || now < this.difficultyGlobalCooldownUntil) return true;
             if (now - this.difficultyLastInputAt < 1800 || now - this.difficultyLastScrollAt < CONFIG.difficultyPostScrollDelay) return true;
@@ -532,6 +594,14 @@
                 return;
             }
             try {
+                if (!(this.preferences || AW_PREFERENCES).ai.allowGemini) {
+                    this.ui.showReadingAssistanceResult(paragraph, {
+                        requestId, mode, result: local, sourceLabel: 'Local explanation',
+                        onClose: reason => this.finishReadingAssistance(paragraph, reason)
+                    });
+                    this.api.log('reading_assistance_shown', { mode, method: 'local', confidence: evidence.score, text_len: originalText.length });
+                    return;
+                }
                 const redactedText = this.redactSensitiveText(originalText).slice(0, CONFIG.difficultyMaxChars);
                 const response = await this.api.simplify(redactedText, mode);
                 const useGemini = Boolean(response?.simplified && String(response.method || '').startsWith('gemini'));
@@ -901,6 +971,7 @@
         }
 
         onRapidSkimDetected(source, tracker) {
+            if ((this.preferences || AW_PREFERENCES).features.compactReading.mode === 'off') return;
             if (CONFIG.debug) console.log('Detected: Rapid Skim', { source: source === window ? 'window' : 'container' });
             this.ui.showScrollToast('Rapid skimming detected. Pause to choose a compact reading view.');
             this.scheduleTldrAssistance(source, tracker);
@@ -931,7 +1002,7 @@
             });
 
             try {
-                const response = summaryText.length >= 120 ? await this.api.summarize(summaryText) : null;
+                const response = (this.preferences || AW_PREFERENCES).ai.allowGemini && summaryText.length >= 120 ? await this.api.summarize(summaryText) : null;
                 const hasRemoteSummary = Boolean(response && response.summary);
                 const method = hasRemoteSummary && !String(response.method || '').startsWith('fallback')
                     ? 'Gemini summary'
@@ -969,6 +1040,7 @@
         }
 
         shouldSuppressScrollSummary(source) {
+            if (!this.featureEnabled('scrollBackSummary')) return true;
             if (this.scrollSummaryInFlight || document.hidden) return true;
             if (this.getScrollSummaryCount() >= CONFIG.scrollSummarySessionLimit) return true;
             if (document.querySelector('.aw-summary-box, .aw-modal-backdrop, .aw-reading-difficulty-prompt, .aw-reading-assistance-panel')) return true;
@@ -1084,6 +1156,9 @@
         }
 
         getTldrPreference() {
+            const syncedMode = this.preferences?.features?.compactReading?.mode;
+            if (syncedMode === 'automatic') return 'auto';
+            if (syncedMode === 'off') return 'off';
             try {
                 const domain = window.location?.hostname || 'local';
                 if (sessionStorage.getItem(`aw-tldr-off-v1:${domain}`) === 'true') return 'off';
@@ -1798,6 +1873,7 @@
         }
 
         onCursorHesitation(analysis) {
+            if (!this.featureEnabled('cursorAssistance')) return;
             const tracker = this.cursorTracker;
             if (tracker.state === 'assisting') return;
 
@@ -1857,6 +1933,10 @@
             if (CONFIG.debug) console.log('User accepted contextual AI help');
             const text = this.buildCursorHelpContext(analysis);
 
+            if (!(this.preferences || AW_PREFERENCES).ai.allowGemini) {
+                this.renderCursorAssistance(this.buildLocalAssistance(analysis, true), analysis, 'fallback');
+                return;
+            }
             this.ui.showSummary('Analyzing the nearby controls with Gemini...', true);
 
             const res = await this.api.suggest(text);
@@ -2628,6 +2708,7 @@
         }
 
         onExitIntent() {
+            if (!this.featureEnabled('exitIntent')) return;
             if (this.exitTriggered) return;
             if (document.querySelector('.aw-suggestion-bubble, .aw-reading-difficulty-prompt, .aw-reading-assistance-panel')) return;
             // Check session storage to prevent annoyance
@@ -3965,8 +4046,9 @@
     }
 
     class ShortcutsManager {
-        constructor(api) {
+        constructor(api, options = {}) {
             this.api = api;
+            this.allowAi = options.allowAi !== false;
             this.shortcuts = [];
             this.targetMap = new Map();
             this.pageActions = [];
@@ -3988,6 +4070,8 @@
             this.shortcuts = this.prepareShortcuts(this.getLocalFallbackShortcuts(), 'Local shortcuts');
             this.renderSidebar();
             this.startListening();
+
+            if (!this.allowAi) return;
 
             const res = await this.api.post('shortcuts', { text: JSON.stringify(context) });
             const grounded = this.prepareShortcuts(res?.shortcuts, res?.method || 'AI shortcuts');
@@ -4446,7 +4530,28 @@
     detector.initCursorHesitation();
 
     // Init Shortcuts
-    new ShortcutsManager(new ApiService());
+    let shortcutsManager = new ShortcutsManager(new ApiService(), { allowAi: AW_PREFERENCES.ai.allowGemini });
+
+    function applyRuntimePreferences(preferences) {
+        if (!detector.setPreferences(preferences)) return;
+        const enabled = AW_PREFERENCES.features.keyboardShortcuts.enabled;
+        if (!enabled && shortcutsManager) {
+            shortcutsManager.destroy();
+            shortcutsManager = null;
+        } else if (enabled && !shortcutsManager) {
+            shortcutsManager = new ShortcutsManager(new ApiService(), { allowAi: AW_PREFERENCES.ai.allowGemini });
+        } else if (enabled && shortcutsManager && shortcutsManager.allowAi !== AW_PREFERENCES.ai.allowGemini) {
+            shortcutsManager.destroy();
+            shortcutsManager = new ShortcutsManager(new ApiService(), { allowAi: AW_PREFERENCES.ai.allowGemini });
+        }
+    }
+
+    window.addEventListener('message', event => {
+        if (event.source === window && event.data?.type === 'AW_PREFERENCES_UPDATE') {
+            applyRuntimePreferences(event.data.preferences);
+        }
+    });
+    window.postMessage({ type: 'AW_REQUEST_PREFERENCES' }, '*');
 
     window.AdaptiveWeb = true;
 
