@@ -1,6 +1,4 @@
-'use client';
-
-import React, { useState } from 'react';
+import Link from 'next/link';
 import { MousePointer2, Scroll, Eye, Zap } from 'lucide-react';
 
 const scrollDemoSections = [
@@ -17,24 +15,6 @@ const scrollDemoSections = [
 ] as const;
 
 export default function Home() {
-  const [email, setEmail] = useState('');
-  const [saved, setSaved] = useState(false);
-
-  // Mock save function for DB
-  const savePreferences = async () => {
-    if (!email) return;
-    try {
-      await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, settings: { optimizeText: true } })
-      });
-      setSaved(true);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 selection:bg-blue-100 selection:text-blue-900">
 
@@ -197,22 +177,11 @@ export default function Home() {
         <div className="max-w-4xl mx-auto px-4 text-center">
           <h2 className="text-3xl font-bold mb-6">Sync Your Preferences</h2>
           <p className="text-blue-100 mb-8 max-w-xl mx-auto">
-            Save your behavior profiles to our secure cloud (MongoDB).
+            Sign in to manage every behavior preference, then securely pair the browser extension with a one-time code.
           </p>
           <div className="flex flex-col sm:flex-row gap-4 justify-center max-w-md mx-auto">
-            <input
-              type="email"
-              placeholder="Enter your email"
-              className="px-6 py-3 rounded-xl text-slate-900 focus:outline-none focus:ring-4 focus:ring-blue-400"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-            <button
-              onClick={savePreferences}
-              className="px-8 py-3 bg-white text-blue-600 font-bold rounded-xl hover:bg-blue-50 transition-colors"
-            >
-              {saved ? 'Saved!' : 'Save Config'}
-            </button>
+            <Link href="/login" className="px-8 py-3 bg-white text-blue-600 font-bold rounded-xl hover:bg-blue-50 transition-colors">Sign in or register</Link>
+            <Link href="/settings" className="px-8 py-3 border border-blue-300 text-white font-bold rounded-xl hover:bg-blue-500 transition-colors">Open settings</Link>
           </div>
         </div>
       </section>

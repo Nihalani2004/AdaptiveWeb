@@ -1,6 +1,5 @@
 import React from 'react';
 import Link from 'next/link';
-import { Download, LayoutGrid, LogIn } from 'lucide-react';
 
 export default function MarketingLayout({
     children,
