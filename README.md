@@ -212,7 +212,9 @@ cd adaptiveweb
 
 ## ⚙️ Configuration
 
-Behavior thresholds are currently defined in the extension's `CONFIG` object in `injected.js`. Reload the unpacked extension after changing them.
+Sign in at `/login` and use `/settings` to manage the versioned behavior profile. Pair the browser extension from its Options page with a one-time code generated in Settings. The extension keeps a last-known-good profile in `chrome.storage.local` and syncs at startup, every 15 minutes, or on demand. See [Account-owned preference sync](docs/PREFERENCE_SYNC.md) for the contract, security model, migration, rollout flag, and recovery behavior.
+
+Low-level detector thresholds remain in `injected.js`; user-facing timing controls are validated by the shared preference contract.
 
 ---
 
