@@ -2,6 +2,28 @@
 
 ## Functional Testing
 
+### Account, dashboard routes, and preference sync
+
+1. Visit `/dashboard`, `/dashboard/analytics`, and `/settings` while signed out. Each must redirect to `/login`.
+2. Register with a name, valid email, and 10+ character password. Confirm the response sets an `HttpOnly`, `SameSite=Lax` `aw_session` cookie and redirects to `/dashboard`.
+3. Open Analytics and Settings from the sidebar. Neither route should return 404, and the displayed user must come from the authenticated account rather than hardcoded profile text.
+4. Change every preference, select **Save preferences**, and confirm success appears only after an HTTP 2xx response. Send a stale revision and verify HTTP `409`; send an unknown field or out-of-range timing and verify HTTP `400`.
+5. Call the retired `POST /api/config` and verify HTTP `410`. Calling `/api/preferences` without a session must return HTTP `401`.
+6. Generate a pairing code, use it once in Extension Options, and verify a second exchange fails. Wait past ten minutes or alter the code and verify pairing fails without replacing an existing local token.
+7. Select **Sync now** and verify changed settings reach an already loaded page. Confirm `chrome.storage.local` contains the extension token but the page's `AW_PREFERENCES_UPDATE` message and DOM never contain it.
+8. Stop the Next.js server and sync again. The options page must report the error while the last-known-good settings stay active. Restart it and verify the next sync clears the error.
+9. Disable each detector and reproduce its trigger. It must not display new assistance. Disable Gemini and confirm reading, cursor, and scroll assistance use local labels while the shortcut panel uses deterministic local bindings.
+10. Disconnect in the extension, then pair again and select **Disconnect all** on the website. The revoked credential must receive HTTP `401` on the next sync.
+
+Automated checks:
+
+```text
+cd frontend && npm run lint
+cd frontend && npm run build
+node --test tests/*.test.cjs
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
 ### Feature 1: Reading-Difficulty Assistance
 
 - **Action**: On a long paragraph (at least 180 characters), read it for several seconds, leave it, and meaningfully return to it twice. Upward regression, selecting its text, or dwelling the pointer over it provide additional evidence.
