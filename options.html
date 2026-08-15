@@ -7,13 +7,26 @@
     <section id="pair-section">
       <h2>Connect your account</h2>
       <p>Open AdaptiveWeb Settings while signed in, generate a one-time code, then enter it here. Your password is never shared with the extension.</p>
-      <label>AdaptiveWeb server<input id="server" type="url" value="http://localhost:3000" spellcheck="false"></label>
+      <label>Account and preference server<input id="control-plane" type="url" value="http://localhost:3000" spellcheck="false"></label>
+      <p class="field-help">Used only for sign-in pairing and preference synchronization.</p>
       <label>Pairing code<input id="code" inputmode="text" maxlength="12" autocomplete="one-time-code" placeholder="A1B2C3D4E5"></label>
       <button id="pair">Connect extension</button>
     </section>
     <section id="connected-section" hidden>
       <h2>Connected</h2><p id="account"></p><p id="last-sync" class="muted"></p>
       <div class="actions"><button id="sync">Sync now</button><button id="disconnect" class="danger">Disconnect</button></div>
+    </section>
+    <section id="backend-section">
+      <h2>AI and analytics backend</h2>
+      <p>FastAPI handles Gemini assistance and behavior analytics. Remote servers must use HTTPS; HTTP is accepted only for local development.</p>
+      <label>FastAPI server<input id="backend-server" type="url" value="http://localhost:8000" spellcheck="false"></label>
+      <p class="field-help">Enter the server base URL without <code>/api</code>. A deployment under a base path is also supported.</p>
+      <div class="actions wrap">
+        <button id="save-backend">Save URL</button>
+        <button id="test-backend" class="secondary">Test and save</button>
+        <button id="reset-backend" class="quiet">Restore local default</button>
+      </div>
+      <p id="backend-status" class="section-status" role="status" aria-live="polite"></p>
     </section>
     <p id="status" role="status" aria-live="polite"></p>
   </main>
