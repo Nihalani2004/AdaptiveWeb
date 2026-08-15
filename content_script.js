@@ -34,7 +34,10 @@
     }
   });
 
-  // API Proxy Listener to prevent HTTPS Mixed Content errors
+  const allowedApiEndpoints = new Set(['suggest', 'analytics', 'simplify', 'summarize', 'related', 'shortcuts']);
+
+  // The background worker owns the configured FastAPI URL and all cross-origin requests.
+  // Page messages may choose only a bounded endpoint, never a destination URL.
   window.addEventListener('message', async function(event) {
     if (event.source === window && event.data?.type === 'AW_REQUEST_PREFERENCES') {
       sendPreferencesToPage();
@@ -42,30 +45,16 @@
     }
     if (event.source === window && event.data && event.data.type === 'AW_API_REQUEST') {
       const { requestId, endpoint, body } = event.data;
-      const allowedEndpoints = new Set(['suggest', 'analytics', 'simplify', 'summarize', 'related', 'shortcuts']);
-      if (!allowedEndpoints.has(endpoint) || typeof requestId !== 'string') return;
-      const controller = new AbortController();
-      const longAiRequest = endpoint === 'suggest' || endpoint === 'summarize' || endpoint === 'simplify';
-      const timeoutId = setTimeout(() => controller.abort(), longAiRequest ? 16000 : 7000);
-      try {
-        const response = await fetch(`http://localhost:8000/api/${endpoint}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: controller.signal
-        });
-        const data = await response.json();
+      if (!allowedApiEndpoints.has(endpoint) || typeof requestId !== 'string' || requestId.length > 80) return;
+      chrome.runtime.sendMessage({ type: 'AW_BACKEND_REQUEST', endpoint, body }, function(response) {
+        const runtimeError = chrome.runtime.lastError?.message;
         window.postMessage({
           type: 'AW_API_RESPONSE',
           requestId,
-          data: response.ok ? data : null,
-          error: response.ok ? null : `HTTP ${response.status}`
+          data: !runtimeError && response?.ok ? response : null,
+          error: runtimeError || response?.error || null
         }, '*');
-      } catch (err) {
-        window.postMessage({ type: 'AW_API_RESPONSE', requestId, data: null, error: err.message }, '*');
-      } finally {
-        clearTimeout(timeoutId);
-      }
+      });
     }
   });
 })();
