@@ -22,6 +22,27 @@ genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 model = genai.GenerativeModel(GEMINI_MODEL)
 
+
+def parse_cors_origins(value):
+    origins = [origin.strip() for origin in str(value or "").split(",") if origin.strip()]
+    return origins or ["*"]
+
+
+def parse_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("PORT must be an integer between 1 and 65535") from error
+    if port < 1 or port > 65535:
+        raise ValueError("PORT must be an integer between 1 and 65535")
+    return port
+
+
+APP_HOST = os.getenv("HOST", "0.0.0.0")
+APP_PORT = parse_port(os.getenv("PORT", "8000"))
+APP_RELOAD = os.getenv("RELOAD", "true").strip().lower() in {"1", "true", "yes", "on"}
+CORS_ORIGINS = parse_cors_origins(os.getenv("CORS_ORIGINS", "*"))
+
 SUGGESTION_ACTION_TYPES = {"highlight", "focus", "compare", "activate"}
 SHORTCUT_ACTION_TYPES = {"focus", "activate", "scroll_top", "scroll_bottom", "toggle_shortcuts"}
 SIMPLIFY_MODES = {"simplify", "terms", "example"}
@@ -451,12 +472,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AdaptiveWeb Backend", version="1.0.0", lifespan=lifespan)
 
-# CORS Configuration
-origins = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -743,4 +761,4 @@ async def get_analytics_stats():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host=APP_HOST, port=APP_PORT, reload=APP_RELOAD)
