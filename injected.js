@@ -66,7 +66,6 @@
         cursorDismissCooldown: 90000,
         cursorPromptLimit: 3,
 
-        serverUrl: 'http://localhost:8000/api',
         debug: true
     };
 
@@ -191,7 +190,7 @@
             const bgColor = this.getEffectiveBackgroundColor(element);
             const isDark = this.isDarkColor(bgColor);
 
-            this.ui.applyHoverEffect(element, isDark, this.api);
+            this.ui.applyHoverEffect(element, isDark, text => this.summarizeTextWithFallback(text));
             this.api.log('hover_dwell', {
                 tag: element.tagName,
                 text_len: element.innerText.length,
@@ -1118,6 +1117,21 @@
             return takeaways.map(item => `- ${item}`).join('\n');
         }
 
+        async summarizeTextWithFallback(text) {
+            const redactedText = this.redactSensitiveText(text).slice(0, CONFIG.scrollContentMaxChars);
+            const local = { summary: this.buildLocalScrollSummary(redactedText), method: 'Local summary' };
+            if (!(this.preferences || AW_PREFERENCES).ai.allowGemini || redactedText.length < 40) return local;
+            try {
+                const response = await this.api.summarize(redactedText);
+                if (response?.summary && String(response.method || '').startsWith('gemini')) {
+                    return { summary: response.summary, method: 'Gemini summary' };
+                }
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb optional summary used the local fallback', error);
+            }
+            return local;
+        }
+
         scheduleTldrAssistance(source, tracker) {
             if (!tracker || tracker.tldrHandled || this.tldrSessions?.get(source)?.active) return;
             const preference = this.getTldrPreference();
@@ -1497,31 +1511,52 @@
             if (CONFIG.debug) console.log('Detected: Engaged Reader');
             this.api.log('engaged_reader');
 
-            // Real-time: Scrape the current page for "Related" or interesting links
+            // Prefer page-authored related links because they remain useful offline.
             const relatedLinks = this.scrapeRelatedLinks();
-
             if (relatedLinks.length > 0) {
                 this.ui.showSidebar(relatedLinks);
-            } else {
-                // Fallback to API if we can't find anything nice
-                const related = await this.api.getRelated(window.location.href);
-                if (related) {
-                    this.ui.showSidebar(related.articles);
-                }
+                return;
             }
+
+            // Ask FastAPI only when the page has no explicit related-content section.
+            // ApiService normally resolves null on transport failure; the catch keeps
+            // this path reliable for any alternate API adapter used by integrations.
+            let remoteArticles = [];
+            try {
+                const related = await this.api.getRelated(window.location.href);
+                remoteArticles = Array.isArray(related?.articles) ? related.articles : [];
+            } catch (error) {
+                if (CONFIG.debug) console.debug('AdaptiveWeb related-content request used the local fallback', error);
+            }
+            if (remoteArticles.length > 0) {
+                this.ui.showSidebar(remoteArticles);
+                return;
+            }
+
+            // A broader, deterministic page-link scan is the final local fallback.
+            // It requires no backend and never invents a destination.
+            const localFallback = this.scrapeRelatedLinks(true);
+            if (localFallback.length > 0) this.ui.showSidebar(localFallback);
         }
 
-        scrapeRelatedLinks() {
-            // Heuristic: Find links in <aside>, or links with images, or just reasonable links
+        scrapeRelatedLinks(includeGeneralLinks = false) {
+            // First pass targets explicit related-content areas. The offline fallback
+            // may widen the scan to ordinary article, main, and navigation links.
             const links = [];
-            const candidates = document.querySelectorAll('aside a, .sidebar a, .related a, article a');
+            const selector = includeGeneralLinks
+                ? 'aside a, .sidebar a, .related a, article a, main a, nav a'
+                : 'aside a, .sidebar a, .related a, article a';
+            const candidates = document.querySelectorAll(selector);
 
             for (let a of candidates) {
                 if (links.length >= 5) break;
 
-                // Filter nice links
-                const title = a.innerText.trim();
-                if (title.length > 15 && a.href && !a.href.includes('#')) {
+                const title = String(a.innerText || a.textContent || a.getAttribute?.('aria-label') || a.getAttribute?.('title') || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                let url = null;
+                try { url = new URL(a.href, window.location.href); } catch { /* Ignore malformed page links. */ }
+                if (title.length > 8 && url && ['http:', 'https:'].includes(url.protocol) && !url.hash && url.href !== window.location.href) {
                     // Try to find an image nearby
                     let img = a.querySelector('img');
                     if (!img) {
@@ -1531,9 +1566,9 @@
                     }
 
                     links.push({
-                        title: title,
-                        url: a.href,
-                        image: img ? img.src : 'https://placehold.co/100x100?text=News' // Fallback
+                        title: title.slice(0, 140),
+                        url: url.href,
+                        image: img?.src || ''
                     });
                 }
             }
@@ -2724,7 +2759,7 @@
             const docHeight = document.documentElement.scrollHeight - window.innerHeight;
             const progress = (scrollY / docHeight) * 100;
 
-            this.ui.showExitModal(progress, this.api);
+            this.ui.showExitModal(progress, text => this.summarizeTextWithFallback(text));
         }
     }
 
@@ -2755,15 +2790,15 @@
         }
 
         async simplify(text, mode = 'simplify') {
-            return this.post('simplify', { text, mode }, 15000);
+            return this.post('simplify', { text, mode }, 20000);
         }
 
         async summarize(text) {
-            return this.post('summarize', { text }, 15000);
+            return this.post('summarize', { text }, 20000);
         }
 
         async suggest(text) {
-            return this.post('suggest', { text }, 15000);
+            return this.post('suggest', { text }, 20000);
         }
 
         async getRelated(url) {
@@ -2813,10 +2848,13 @@
                 }
                 .aw-sidebar.visible { right: 0; }
                 .aw-card {
+                    display: block;
                     border: 1px solid #eee;
                     border-radius: 8px;
                     margin-bottom: 15px;
                     overflow: hidden;
+                    color: #1f2937;
+                    text-decoration: none;
                 }
                 .aw-card img { width: 100%; height: 100px; object-fit: cover; }
                 .aw-card-content { padding: 10px; }
@@ -2901,7 +2939,7 @@
             document.head.appendChild(style);
         }
 
-        applyHoverEffect(el, isCurrentBgDark, api) {
+        applyHoverEffect(el, isCurrentBgDark, summarize) {
             // If current BG is Dark -> We want White Overlay (aw-hover-dark)
             // If current BG is Light -> We want Black Overlay (aw-hover-light)
             if (isCurrentBgDark) {
@@ -2913,7 +2951,9 @@
             // Inject Summarize Button
             if (el.querySelector('.aw-summarize-btn')) return;
 
-            const btn = document.createElement('div');
+            const sourceText = el.innerText || el.textContent || '';
+            const btn = document.createElement('button');
+            btn.type = 'button';
             btn.className = 'aw-summarize-btn';
             btn.innerHTML = '📝 Summarize';
 
@@ -2938,13 +2978,10 @@
                 e.preventDefault();
                 btn.innerHTML = 'Thinking...';
 
-                // Use passed API or fallback
-                const apiService = api || new ApiService();
-                const text = el.innerText;
-                const res = await apiService.summarize(text);
+                const res = typeof summarize === 'function' ? await summarize(sourceText) : null;
 
                 if (res && res.summary) {
-                    this.showTakeaways(res.summary);
+                    this.showTakeaways(res.summary, res.method);
                     btn.innerHTML = 'Done!';
                     setTimeout(() => btn.innerHTML = '📝 Summarize', 2000);
                 } else {
@@ -3235,27 +3272,59 @@
 
         // 2. Sidebar
         showSidebar(articles) {
+            document.querySelector('.aw-sidebar')?.remove();
             const sidebar = document.createElement('div');
             sidebar.className = 'aw-sidebar';
-            sidebar.innerHTML = `
-                <h2>You might also like</h2>
-                <hr style="margin: 10px 0; border: 0; border-top: 1px solid #eee;">
-                ${articles.map(a => `
-                    <div class="aw-card">
-                        <img src="${a.image}" alt="">
-                        <div class="aw-card-content">
-                            <strong>${a.title}</strong>
-                        </div>
-                    </div>
-                `).join('')}
-                <button class="aw-btn" style="width:100%" id="aw-sidebar-close">Close</button>
-            `;
+            sidebar.setAttribute('role', 'complementary');
+            sidebar.setAttribute('aria-label', 'Related reading');
+
+            const heading = document.createElement('h2');
+            heading.textContent = 'You might also like';
+            const divider = document.createElement('hr');
+            divider.style.cssText = 'margin:10px 0;border:0;border-top:1px solid #eee;';
+            sidebar.append(heading, divider);
+
+            const safeArticles = Array.isArray(articles) ? articles.slice(0, 5) : [];
+            safeArticles.forEach(article => {
+                let destination = null;
+                try {
+                    const candidate = new URL(String(article?.url || ''), window.location.href);
+                    if (['http:', 'https:'].includes(candidate.protocol)) destination = candidate.href;
+                } catch { /* Ignore invalid backend or page-provided destinations. */ }
+                if (!destination) return;
+
+                const card = document.createElement('a');
+                card.className = 'aw-card';
+                card.href = destination;
+                const imageUrl = String(article?.image || '');
+                if (/^https?:\/\//i.test(imageUrl)) {
+                    const image = document.createElement('img');
+                    image.src = imageUrl;
+                    image.alt = '';
+                    image.loading = 'lazy';
+                    card.appendChild(image);
+                }
+                const content = document.createElement('div');
+                content.className = 'aw-card-content';
+                const title = document.createElement('strong');
+                title.textContent = String(article?.title || 'Related page').replace(/\s+/g, ' ').trim().slice(0, 140) || 'Related page';
+                content.appendChild(title);
+                card.appendChild(content);
+                sidebar.appendChild(card);
+            });
+
+            const closeButton = document.createElement('button');
+            closeButton.type = 'button';
+            closeButton.className = 'aw-btn';
+            closeButton.style.width = '100%';
+            closeButton.textContent = 'Close';
+            sidebar.appendChild(closeButton);
             document.body.appendChild(sidebar);
 
-            sidebar.querySelector('#aw-sidebar-close').onclick = () => {
+            closeButton.addEventListener('click', () => {
                 sidebar.classList.remove('visible');
                 setTimeout(() => sidebar.remove(), 300);
-            }
+            });
 
             // Trigger reflow
             sidebar.offsetHeight;
@@ -3949,8 +4018,7 @@
             document.body.appendChild(box);
         }
 
-        showTakeaways(summary) {
-            // "Summarize" button output -> Use same box but add expansion logic
+        showTakeaways(summary, method = '') {
             if (this.currentSummaryBox && this.currentSummaryBox.isConnected) {
                 this.currentSummaryBox.remove();
             }
@@ -3959,34 +4027,57 @@
             box.className = 'aw-takeaways';
             this.currentSummaryBox = box;
 
-            // Simple truncate for visual cleaness, "Expand" to see full
-            const isLong = summary.length > 150; // Lowered from 300
+            const isLong = summary.length > 150;
             const displaySummary = isLong ? summary.substring(0, 150) + '...' : summary;
-
-            box.innerHTML = `
-                <h3 style="margin:0 0 10px 0">⚡ Key Takeaways</h3>
-                <div class="aw-summary-content">
-                    <p style="font-size: 14px; line-height: 1.5; color: #444;">${displaySummary}</p>
-                </div>
-                ${isLong ? '<div style="margin-top:5px;"><button id="aw-expand-btn" style="background:none; border:none; color:#3b82f6; cursor:pointer; font-size:12px; font-weight:bold; padding:0;">View Full Context ⬇</button></div>' : ''}
-                <div style="text-align:right; margin-top:10px;">
-                    <small style="color:#888; cursor:pointer;" id="aw-takeaways-close">Dismiss</small>
-                </div>
-            `;
-            document.body.appendChild(box);
-
-            // Expand Logic
-            if (isLong) {
-                box.querySelector('#aw-expand-btn').onclick = (e) => {
-                    e.target.remove();
-                    box.querySelector('.aw-summary-content p').innerText = summary;
-                };
+            box.setAttribute('role', 'dialog');
+            box.setAttribute('aria-label', 'AdaptiveWeb key takeaways');
+            const heading = document.createElement('h3');
+            heading.style.margin = '0 0 10px 0';
+            heading.textContent = 'Key Takeaways';
+            const content = document.createElement('div');
+            content.className = 'aw-summary-content';
+            if (method) {
+                const badge = document.createElement('span');
+                badge.className = 'aw-assistance-source';
+                badge.textContent = String(method);
+                content.appendChild(badge);
             }
-
-            box.querySelector('#aw-takeaways-close').onclick = () => box.remove();
+            const paragraph = document.createElement('p');
+            paragraph.style.cssText = 'font-size:14px;line-height:1.5;color:#444;';
+            paragraph.textContent = displaySummary;
+            content.appendChild(paragraph);
+            box.append(heading, content);
+            if (isLong) {
+                const expandRow = document.createElement('div');
+                expandRow.style.marginTop = '5px';
+                const expand = document.createElement('button');
+                expand.type = 'button';
+                expand.id = 'aw-expand-btn';
+                expand.style.cssText = 'background:none;border:none;color:#3b82f6;cursor:pointer;font-size:12px;font-weight:bold;padding:0;';
+                expand.textContent = 'View full context';
+                expand.addEventListener('click', () => {
+                    expandRow.remove();
+                    paragraph.textContent = summary;
+                });
+                expandRow.appendChild(expand);
+                box.appendChild(expandRow);
+            }
+            const footer = document.createElement('div');
+            footer.style.cssText = 'text-align:right;margin-top:10px;';
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'aw-summary-dismiss';
+            close.textContent = 'Dismiss';
+            close.addEventListener('click', () => {
+                box.remove();
+                if (this.currentSummaryBox === box) this.currentSummaryBox = null;
+            });
+            footer.appendChild(close);
+            box.appendChild(footer);
+            document.body.appendChild(box);
         }
 
-        showExitModal(progress, api) {
+        showExitModal(progress, summarize) {
             if (document.querySelector('.aw-modal-backdrop')) return;
 
             let title = "Wait!";
@@ -4032,10 +4123,12 @@
                 if (btnText === "Show Summary") {
                     primaryBtn.innerText = "Summarizing...";
                     const text = document.body.innerText.substring(0, 2000);
-                    const summary = await api.summarize(text);
-                    if (summary) {
-                        this.showTakeaways(summary.summary);
+                    const summary = typeof summarize === 'function' ? await summarize(text) : null;
+                    if (summary?.summary) {
+                        this.showTakeaways(summary.summary, summary.method);
                         close();
+                    } else {
+                        primaryBtn.innerText = 'Summary unavailable';
                     }
                 } else {
                     alert("Feature coming soon!");
