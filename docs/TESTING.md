@@ -24,6 +24,17 @@ node --test tests/*.test.cjs
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+### Configurable FastAPI backend
+
+1. Open Extension Options and confirm the account server and FastAPI server are shown as separate fields.
+2. Save `http://localhost:8000`, `http://127.0.0.1:8100`, and a valid HTTPS URL. Confirm trailing slashes are normalized.
+3. Verify remote HTTP, credential-containing, query-string, fragment, `file:`, and `javascript:` URLs are rejected without replacing the previous saved URL.
+4. Start FastAPI on port `8100`, enter `http://127.0.0.1:8100`, and select **Test and save**. Confirm `/health` succeeds and subsequent assistance requests use port `8100`.
+5. Stop FastAPI and repeat the check. The Options page must report the failure and retain the previously working backend URL.
+6. Select **Restore local default** and confirm the URL returns to `http://localhost:8000`.
+7. Trigger reading, hover summary, scroll summary, cursor help, shortcuts, and exit summary with FastAPI stopped. Supported features must use a labeled local fallback or show a bounded unavailable state without breaking the page.
+8. Inspect page messages and confirm they contain an endpoint and body but never a backend destination URL or extension credential.
+
 ### Feature 1: Reading-Difficulty Assistance
 
 - **Action**: On a long paragraph (at least 180 characters), read it for several seconds, leave it, and meaningfully return to it twice. Upward regression, selecting its text, or dwelling the pointer over it provide additional evidence.

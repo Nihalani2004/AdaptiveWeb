@@ -197,7 +197,7 @@ adaptiveweb/
 ## 🚀 Installation (Chrome Extension)
 
 ```bash
-git clone https://github.com/yourusername/adaptiveweb.git
+git clone https://github.com/Nihalani2004/AdaptiveWeb.git
 cd adaptiveweb
 ```
 
@@ -213,6 +213,8 @@ cd adaptiveweb
 ## ⚙️ Configuration
 
 Sign in at `/login` and use `/settings` to manage the versioned behavior profile. Pair the browser extension from its Options page with a one-time code generated in Settings. The extension keeps a last-known-good profile in `chrome.storage.local` and syncs at startup, every 15 minutes, or on demand. See [Account-owned preference sync](docs/PREFERENCE_SYNC.md) for the contract, security model, migration, rollout flag, and recovery behavior.
+
+Extension Options keeps two server addresses separate. The **account and preference server** defaults to `http://localhost:3000`; the **AI and analytics backend** defaults to `http://localhost:8000`. FastAPI requests are made by the extension background worker using the locally stored, validated backend URL. Remote services require HTTPS, while HTTP is permitted only for local development. Use **Test and save** to verify the configured FastAPI `/health` endpoint.
 
 Low-level detector thresholds remain in `injected.js`; user-facing timing controls are validated by the shared preference contract.
 
