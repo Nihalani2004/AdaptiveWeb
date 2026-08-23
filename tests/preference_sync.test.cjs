@@ -101,6 +101,35 @@ test('optional hover and exit summaries honor Gemini preference and retain a lab
     assert.equal(remoteCalls, 1);
 });
 
+test('hover fallback turns a long legal-style sentence into readable local passages', async () => {
+    const detector = Object.create(runtime.__BehaviorDetector.prototype);
+    const preferences = validPreferences();
+    preferences.ai.allowGemini = false;
+    detector.preferences = preferences;
+    detector.api = { summarize: async () => null };
+    const text = 'Where any party against whom an interim order, whether by way of injunction or stay or in any other manner, is made on, or in any proceedings relating to a petition under clause (1), without furnishing a complete explanation, the court may consider the request.';
+
+    const local = await detector.summarizeTextWithFallback(text);
+
+    assert.equal(local.method, 'Local summary');
+    assert.equal(local.takeaways.length, 3);
+    assert.match(local.summary, /^- /m);
+    assert.ok(local.takeaways.every(item => !/\bclau$/i.test(item)));
+    assert.match(local.fallbackNotice, /selected key passages locally/i);
+});
+
+test('hover takeaway UI keeps summary text intact and provides original paragraph access', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'injected.js'), 'utf8');
+    const start = source.indexOf('showTakeaways(summary, method = \'\', options = {})');
+    const end = source.indexOf('showExitModal(progress, summarize)', start);
+    const implementation = source.slice(start, end);
+
+    assert.ok(start >= 0 && end > start);
+    assert.match(implementation, /aw-hover-takeaway-list/);
+    assert.match(implementation, /Show original paragraph/);
+    assert.doesNotMatch(implementation, /summary\.substring\(0, 150\)/);
+});
+
 test('engaged-reader assistance falls back to grounded page links when FastAPI is unavailable', async () => {
     const detector = Object.create(runtime.__BehaviorDetector.prototype);
     const fallbackArticle = { title: 'A related page found locally', url: 'https://example.com/related', image: '' };

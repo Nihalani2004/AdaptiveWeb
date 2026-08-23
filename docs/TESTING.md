@@ -48,9 +48,9 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - **Backend contract**: For all three modes, verify the response includes `simplified`, `keyTerms`, `example`, `warnings`, `method`, and `mode`. Model output missing source names or numbers must be rejected in favor of the complete local fallback.
 
 ### Hover Dwell
-- **Action**: Hover over a paragraph (>50px size) for 1.5 seconds.
-- **Expected**: A yellow highlight appears.
-- **Verification**: Check `injected.css` class `.aw-highlighted` is applied.
+- **Action**: Hover over an eligible paragraph for the configured dwell time and select **Summarize**.
+- **Expected**: A **Key Takeaways** panel appears. Gemini results are labeled `Gemini summary`; when Gemini is disabled or unavailable, the panel is labeled `Local summary` and explains that key passages were selected locally.
+- **Verification**: A multi-sentence paragraph renders up to three readable takeaways without a 150-character UI truncation. A long single legal-style sentence is split only at safe clause boundaries and never ends in a partial word. **Show original paragraph** reveals the complete source text.
 
 ### Feature 2: Scroll-Back Summary
 - **Action**: On a page or nested panel with at least 480 px of scrollable range, scroll quickly past 85% depth and return above 20% depth within 18 seconds.
