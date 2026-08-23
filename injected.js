@@ -1117,10 +1117,59 @@
             return takeaways.map(item => `- ${item}`).join('\n');
         }
 
+        buildLocalHoverSummary(text) {
+            const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+            if (!normalized) {
+                return ['Review this paragraph directly; no readable local key point could be extracted.'];
+            }
+
+            const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [normalized];
+            const passages = sentences.length > 1
+                ? sentences
+                : normalized.split(/(?:[;:]\s+)|(?:\s+[—–-]\s+)|(?:,\s+(?=(?:and|but|or|where|when|whether|if|unless|without|provided|including)\b))/i);
+            const points = [];
+            for (const passage of passages) {
+                const clean = String(passage || '').replace(/\s+/g, ' ').trim();
+                if (clean.length < 28) continue;
+                const clipped = this.clipHoverSummaryPoint(clean);
+                const duplicate = points.some(point => point.replace(/…$/, '').toLowerCase() === clipped.replace(/…$/, '').toLowerCase());
+                if (!duplicate) points.push(clipped);
+                if (points.length >= 3) break;
+            }
+
+            return points.length > 0
+                ? points
+                : [this.clipHoverSummaryPoint(normalized)];
+        }
+
+        clipHoverSummaryPoint(text, maxLength = 210) {
+            const clean = String(text || '').replace(/\s+/g, ' ').trim();
+            if (clean.length <= maxLength) return clean;
+            const boundary = clean.lastIndexOf(' ', maxLength);
+            const end = boundary >= Math.floor(maxLength * 0.6) ? boundary : maxLength;
+            return `${clean.slice(0, end).trim()}…`;
+        }
+
         async summarizeTextWithFallback(text) {
             const redactedText = this.redactSensitiveText(text).slice(0, CONFIG.scrollContentMaxChars);
-            const local = { summary: this.buildLocalScrollSummary(redactedText), method: 'Local summary' };
-            if (!(this.preferences || AW_PREFERENCES).ai.allowGemini || redactedText.length < 40) return local;
+            const localTakeaways = this.buildLocalHoverSummary(redactedText);
+            const local = {
+                summary: localTakeaways.map(item => `- ${item}`).join('\n'),
+                takeaways: localTakeaways,
+                method: 'Local summary'
+            };
+            if (!(this.preferences || AW_PREFERENCES).ai.allowGemini) {
+                return {
+                    ...local,
+                    fallbackNotice: 'Gemini is off, so AdaptiveWeb selected key passages locally.'
+                };
+            }
+            if (redactedText.length < 40) {
+                return {
+                    ...local,
+                    fallbackNotice: 'This paragraph is too short for Gemini, so AdaptiveWeb selected key passages locally.'
+                };
+            }
             try {
                 const response = await this.api.summarize(redactedText);
                 if (response?.summary && String(response.method || '').startsWith('gemini')) {
