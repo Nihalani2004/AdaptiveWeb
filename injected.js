@@ -1178,7 +1178,10 @@
             } catch (error) {
                 if (CONFIG.debug) console.debug('AdaptiveWeb optional summary used the local fallback', error);
             }
-            return local;
+            return {
+                ...local,
+                fallbackNotice: 'Gemini was unavailable, so AdaptiveWeb selected key passages locally.'
+            };
         }
 
         scheduleTldrAssistance(source, tracker) {
@@ -3080,7 +3083,11 @@
                 const res = typeof summarize === 'function' ? await summarize(sourceText) : null;
 
                 if (res && res.summary) {
-                    this.showTakeaways(res.summary, res.method);
+                    this.showTakeaways(res.summary, res.method, {
+                        takeaways: res.takeaways,
+                        originalText: sourceText,
+                        fallbackNotice: res.fallbackNotice
+                    });
                     btn.innerHTML = 'Done!';
                     setTimeout(() => btn.innerHTML = '📝 Summarize', 2000);
                 } else {
@@ -4117,7 +4124,7 @@
             document.body.appendChild(box);
         }
 
-        showTakeaways(summary, method = '') {
+        showTakeaways(summary, method = '', options = {}) {
             if (this.currentSummaryBox && this.currentSummaryBox.isConnected) {
                 this.currentSummaryBox.remove();
             }
@@ -4126,10 +4133,9 @@
             box.className = 'aw-takeaways';
             this.currentSummaryBox = box;
 
-            const isLong = summary.length > 150;
-            const displaySummary = isLong ? summary.substring(0, 150) + '...' : summary;
             box.setAttribute('role', 'dialog');
             box.setAttribute('aria-label', 'AdaptiveWeb key takeaways');
+            box.setAttribute('aria-live', 'polite');
             const heading = document.createElement('h3');
             heading.style.margin = '0 0 10px 0';
             heading.textContent = 'Key Takeaways';
@@ -4137,29 +4143,52 @@
             content.className = 'aw-summary-content';
             if (method) {
                 const badge = document.createElement('span');
-                badge.className = 'aw-assistance-source';
+                badge.className = `aw-assistance-source${method === 'Local summary' ? ' aw-assistance-source--local' : ''}`;
                 badge.textContent = String(method);
                 content.appendChild(badge);
             }
-            const paragraph = document.createElement('p');
-            paragraph.style.cssText = 'font-size:14px;line-height:1.5;color:#444;';
-            paragraph.textContent = displaySummary;
-            content.appendChild(paragraph);
-            box.append(heading, content);
-            if (isLong) {
-                const expandRow = document.createElement('div');
-                expandRow.style.marginTop = '5px';
-                const expand = document.createElement('button');
-                expand.type = 'button';
-                expand.id = 'aw-expand-btn';
-                expand.style.cssText = 'background:none;border:none;color:#3b82f6;cursor:pointer;font-size:12px;font-weight:bold;padding:0;';
-                expand.textContent = 'View full context';
-                expand.addEventListener('click', () => {
-                    expandRow.remove();
-                    paragraph.textContent = summary;
+
+            const parsedLines = String(summary || '')
+                .split(/\n+/)
+                .map(line => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim())
+                .filter(Boolean);
+            const takeaways = Array.isArray(options.takeaways) && options.takeaways.length > 0
+                ? options.takeaways.map(item => String(item || '').trim()).filter(Boolean)
+                : parsedLines;
+            if (takeaways.length > 1) {
+                const list = document.createElement('ul');
+                list.className = 'aw-hover-takeaway-list';
+                takeaways.slice(0, 3).forEach(item => {
+                    const listItem = document.createElement('li');
+                    listItem.textContent = item;
+                    list.appendChild(listItem);
                 });
-                expandRow.appendChild(expand);
-                box.appendChild(expandRow);
+                content.appendChild(list);
+            } else {
+                const paragraph = document.createElement('p');
+                paragraph.className = 'aw-hover-summary-text';
+                paragraph.textContent = takeaways[0] || 'No concise takeaway was available for this paragraph.';
+                content.appendChild(paragraph);
+            }
+
+            if (options.fallbackNotice) {
+                const note = document.createElement('p');
+                note.className = 'aw-hover-summary-note';
+                note.textContent = String(options.fallbackNotice);
+                content.appendChild(note);
+            }
+            box.append(heading, content);
+
+            const originalText = String(options.originalText || '').replace(/\s+/g, ' ').trim();
+            if (originalText) {
+                const original = document.createElement('details');
+                original.className = 'aw-hover-original';
+                const originalLabel = document.createElement('summary');
+                originalLabel.textContent = 'Show original paragraph';
+                const originalBody = document.createElement('p');
+                originalBody.textContent = originalText;
+                original.append(originalLabel, originalBody);
+                box.appendChild(original);
             }
             const footer = document.createElement('div');
             footer.style.cssText = 'text-align:right;margin-top:10px;';
