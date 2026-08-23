@@ -2925,6 +2925,56 @@
                     animation: slideIn 0.5s ease;
                     overflow-y: auto;
                 }
+                .aw-takeaways h3 {
+                    color: #172033;
+                    font-size: 20px;
+                    line-height: 1.25;
+                }
+                .aw-takeaways .aw-summary-content {
+                    display: grid;
+                    gap: 10px;
+                }
+                .aw-hover-takeaway-list {
+                    display: grid;
+                    gap: 8px;
+                    margin: 0;
+                    padding-left: 20px;
+                    color: #334155;
+                    font-size: 14px;
+                    line-height: 1.55;
+                }
+                .aw-hover-takeaway-list li::marker {
+                    color: #2563eb;
+                }
+                .aw-hover-summary-text {
+                    margin: 0;
+                    color: #334155;
+                    font-size: 14px;
+                    line-height: 1.55;
+                    white-space: pre-line;
+                }
+                .aw-hover-summary-note {
+                    margin: 0;
+                    color: #64748b;
+                    font-size: 11px;
+                    line-height: 1.45;
+                }
+                .aw-hover-original {
+                    border-top: 1px solid #e2e8f0;
+                    padding-top: 9px;
+                    color: #475569;
+                    font-size: 12px;
+                    line-height: 1.5;
+                }
+                .aw-hover-original summary {
+                    color: #2563eb;
+                    cursor: pointer;
+                    font-weight: 700;
+                }
+                .aw-hover-original p {
+                    margin: 8px 0 0;
+                    white-space: pre-wrap;
+                }
                 @keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
                 
                 /* Exit Modal */
