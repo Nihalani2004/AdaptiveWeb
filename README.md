@@ -10,6 +10,7 @@
 ![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue)
 ![Architecture](https://img.shields.io/badge/System-Architecture-orange)
 ![License](https://img.shields.io/badge/License-MIT-blue)
+[![AdaptiveWeb CI](https://github.com/Nihalani2004/AdaptiveWeb/actions/workflows/ci.yml/badge.svg)](https://github.com/Nihalani2004/AdaptiveWeb/actions/workflows/ci.yml)
 
 ---
 
